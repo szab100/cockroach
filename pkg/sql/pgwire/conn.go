@@ -97,9 +97,6 @@ type conn struct {
 	readBuf    pgwirebase.ReadBuffer
 	msgBuilder writeBuffer
 
-	// vecsScratch is a scratch space used by bufferBatch.
-	vecsScratch coldata.TypedVecs
-
 	sv *settings.Values
 
 	// alwaysLogAuthActivity is used force-enables logging of authn events.
@@ -868,9 +865,9 @@ func (c *conn) handleParse(
 			if t == 0 {
 				continue
 			}
-			// If the OID is user defined or unknown, then write nil into the type
-			// hints and let the consumer of the PrepareStmt resolve the types.
-			if t == oid.T_unknown || types.IsOIDUserDefinedType(t) {
+			// If the OID is user defined, then write nil into the type hints and let
+			// the consumer of the PrepareStmt resolve the types.
+			if types.IsOIDUserDefinedType(t) {
 				sqlTypeHints[i] = nil
 				continue
 			}
@@ -1293,35 +1290,31 @@ func (c *conn) bufferBatch(
 ) {
 	sel := batch.Selection()
 	n := batch.Length()
-	if n > 0 {
-		c.vecsScratch.SetBatch(batch)
-		// Make sure that c doesn't hold on to the memory of the batch.
-		defer c.vecsScratch.Reset()
-		width := int16(len(c.vecsScratch.Vecs))
-		for i := 0; i < n; i++ {
-			rowIdx := i
-			if sel != nil {
-				rowIdx = sel[rowIdx]
+	vecs := batch.ColVecs()
+	width := int16(len(vecs))
+	for i := 0; i < n; i++ {
+		rowIdx := i
+		if sel != nil {
+			rowIdx = sel[rowIdx]
+		}
+		c.msgBuilder.initMsg(pgwirebase.ServerMsgDataRow)
+		c.msgBuilder.putInt16(width)
+		for colIdx, col := range vecs {
+			fmtCode := pgwirebase.FormatText
+			if formatCodes != nil {
+				fmtCode = formatCodes[colIdx]
 			}
-			c.msgBuilder.initMsg(pgwirebase.ServerMsgDataRow)
-			c.msgBuilder.putInt16(width)
-			for vecIdx := 0; vecIdx < len(c.vecsScratch.Vecs); vecIdx++ {
-				fmtCode := pgwirebase.FormatText
-				if formatCodes != nil {
-					fmtCode = formatCodes[vecIdx]
-				}
-				switch fmtCode {
-				case pgwirebase.FormatText:
-					c.msgBuilder.writeTextColumnarElement(ctx, &c.vecsScratch, vecIdx, rowIdx, conv, sessionLoc)
-				case pgwirebase.FormatBinary:
-					c.msgBuilder.writeBinaryColumnarElement(ctx, &c.vecsScratch, vecIdx, rowIdx, sessionLoc)
-				default:
-					c.msgBuilder.setError(errors.Errorf("unsupported format code %s", fmtCode))
-				}
+			switch fmtCode {
+			case pgwirebase.FormatText:
+				c.msgBuilder.writeTextColumnarElement(ctx, col, rowIdx, conv, sessionLoc)
+			case pgwirebase.FormatBinary:
+				c.msgBuilder.writeBinaryColumnarElement(ctx, col, rowIdx, sessionLoc)
+			default:
+				c.msgBuilder.setError(errors.Errorf("unsupported format code %s", fmtCode))
 			}
-			if err := c.msgBuilder.finishMsg(&c.writerState.buf); err != nil {
-				panic(fmt.Sprintf("unexpected err from buffer: %s", err))
-			}
+		}
+		if err := c.msgBuilder.finishMsg(&c.writerState.buf); err != nil {
+			panic(fmt.Sprintf("unexpected err from buffer: %s", err))
 		}
 	}
 }
