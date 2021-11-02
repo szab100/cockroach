@@ -42,7 +42,7 @@ func (s *statusTrackingExecutor) ExecuteJob(
 
 func (s *statusTrackingExecutor) NotifyJobTermination(
 	ctx context.Context,
-	jobID jobspb.JobID,
+	jobID int64,
 	jobStatus Status,
 	_ jobspb.Details,
 	env scheduledjobs.JobSchedulerEnv,
@@ -72,10 +72,9 @@ func TestScheduledJobExecutorRegistration(t *testing.T) {
 	instance := newStatusTrackingExecutor()
 	defer registerScopedScheduledJobExecutor(executorName, instance)()
 
-	registered, created, err := GetScheduledJobExecutor(executorName)
+	registered, err := GetScheduledJobExecutor(executorName)
 	require.NoError(t, err)
 	require.Equal(t, instance, registered)
-	require.True(t, created)
 }
 
 func TestJobTerminationNotification(t *testing.T) {

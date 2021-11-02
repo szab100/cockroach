@@ -97,6 +97,49 @@ func TestRestoreOldVersions(t *testing.T) {
 	// versions, but are now disallowed, but we should check that we fail
 	// gracefully with them.
 	t.Run("exceptional-backups", func(t *testing.T) {
+		t.Run("duplicate-db-desc", func(t *testing.T) {
+			backupUnderTest := "doubleDB"
+			/*
+					This backup was generated with the following SQL on (v21.1.6):
+
+				  CREATE DATABASE db1;
+				  DROP DATABASE db1;
+				  CREATE DATABASE db1;
+				  BACKUP TO 'nodelocal://1/doubleDB' WITH revision_history;
+			*/
+			dir, err := os.Stat(filepath.Join(exceptionalDirs, backupUnderTest))
+			require.NoError(t, err)
+			require.True(t, dir.IsDir())
+
+			// We could create tables which reference types in another database on
+			// 20.2 release candidates.
+			exportDir, err := filepath.Abs(filepath.Join(exceptionalDirs, dir.Name()))
+			require.NoError(t, err)
+
+			externalDir, dirCleanup := testutils.TempDir(t)
+			ctx := context.Background()
+			tc := testcluster.StartTestCluster(t, singleNode, base.TestClusterArgs{
+				ServerArgs: base.TestServerArgs{
+					ExternalIODir: externalDir,
+				},
+			})
+			sqlDB := sqlutils.MakeSQLRunner(tc.Conns[0])
+			defer func() {
+				tc.Stopper().Stop(ctx)
+				dirCleanup()
+			}()
+			err = os.Symlink(exportDir, filepath.Join(externalDir, "foo"))
+			require.NoError(t, err)
+
+			sqlDB.Exec(t, `RESTORE FROM $1`, LocalFoo)
+			sqlDB.Exec(t, `DROP DATABASE db1;`)
+			sqlDB.Exec(t, `RESTORE DATABASE db1 FROM $1`, LocalFoo)
+			sqlDB.CheckQueryResults(t,
+				`SELECT count(*) FROM [SHOW DATABASES] WHERE database_name = 'db1'`,
+				[][]string{{"1"}},
+			)
+		})
+
 		t.Run("x-db-type-reference", func(t *testing.T) {
 			backupUnderTest := "xDbRef"
 			/*
@@ -169,7 +212,7 @@ func restoreOldVersionTest(exportDir string) func(t *testing.T) {
 		params := base.TestServerArgs{}
 		const numAccounts = 1000
 		_, _, sqlDB, dir, cleanup := backupRestoreTestSetupWithParams(t, singleNode, numAccounts,
-			InitManualReplication, base.TestClusterArgs{ServerArgs: params})
+			InitNone, base.TestClusterArgs{ServerArgs: params})
 		defer cleanup()
 		err := os.Symlink(exportDir, filepath.Join(dir, "foo"))
 		require.NoError(t, err)
@@ -191,10 +234,6 @@ func restoreOldVersionTest(exportDir string) func(t *testing.T) {
 		sqlDB.CheckQueryResults(t, `SELECT * FROM test.t1 ORDER BY k`, results)
 		sqlDB.CheckQueryResults(t, `SELECT * FROM test.t2 ORDER BY k`, results)
 		sqlDB.CheckQueryResults(t, `SELECT * FROM test.t4 ORDER BY k`, results)
-
-		results = append(results, []string{"4", "5", "6"})
-		sqlDB.Exec(t, `INSERT INTO test.t1 VALUES (4, 5 ,6)`)
-		sqlDB.CheckQueryResults(t, `SELECT * FROM test.t1 ORDER BY k`, results)
 	}
 }
 
@@ -206,19 +245,19 @@ func restoreOldVersionTest(exportDir string) func(t *testing.T) {
 func restoreV201ZoneconfigPrivilegeTest(exportDir string) func(t *testing.T) {
 	return func(t *testing.T) {
 		const numAccounts = 1000
-		_, _, _, tmpDir, cleanupFn := BackupRestoreTestSetup(t, MultiNode, numAccounts, InitManualReplication)
+		_, _, _, tmpDir, cleanupFn := BackupRestoreTestSetup(t, MultiNode, numAccounts, InitNone)
 		defer cleanupFn()
 
 		_, _, sqlDB, cleanup := backupRestoreTestSetupEmpty(t, singleNode, tmpDir,
-			InitManualReplication, base.TestClusterArgs{})
+			InitNone, base.TestClusterArgs{})
 		defer cleanup()
 		err := os.Symlink(exportDir, filepath.Join(tmpDir, "foo"))
 		require.NoError(t, err)
 		sqlDB.Exec(t, `RESTORE FROM $1`, LocalFoo)
 		testDBGrants := [][]string{
-			{"test", "admin", "ALL"},
-			{"test", "root", "ALL"},
-			{"test", "testuser", "ZONECONFIG"},
+			{"test", "public", "admin", "ALL"},
+			{"test", "public", "root", "ALL"},
+			{"test", "public", "testuser", "ZONECONFIG"},
 		}
 		sqlDB.CheckQueryResults(t, `show grants on database test`, testDBGrants)
 
@@ -243,7 +282,7 @@ func restoreOldVersionFKRevTest(exportDir string) func(t *testing.T) {
 		params := base.TestServerArgs{}
 		const numAccounts = 1000
 		_, _, sqlDB, dir, cleanup := backupRestoreTestSetupWithParams(t, singleNode, numAccounts,
-			InitManualReplication, base.TestClusterArgs{ServerArgs: params})
+			InitNone, base.TestClusterArgs{ServerArgs: params})
 		defer cleanup()
 		err := os.Symlink(exportDir, filepath.Join(dir, "foo"))
 		require.NoError(t, err)
@@ -452,7 +491,6 @@ func TestRestoreOldBackupMissingOfflineIndexes(t *testing.T) {
 			sqlDBRestore := sqlutils.MakeSQLRunner(restoreTC.Conns[0])
 			from := strings.Join(backupDirs[:i], `,`)
 			sqlDBRestore.Exec(t, fmt.Sprintf(`RESTORE FROM %s`, from))
-
 			for j := i; j > 1; j-- {
 				var res int64
 				switch j % 3 {
@@ -475,9 +513,9 @@ func TestRestoreOldBackupMissingOfflineIndexes(t *testing.T) {
 					if res != expected {
 						t.Fatalf("got %d, expected %d", res, expected)
 					}
-				// case 1 and 0 are both inverted, which we can't validate via SQL, so
-				// this is just checking that it eventually shows up, i.e. that the code
-				// to validate and create the schema change works.
+					// case 1 and 0 are both inverted, which we can't validate via SQL, so
+					// this is just checking that it eventually shows up, i.e. that the code
+					// to validate and create the schema change works.
 				case 0:
 					found := false
 					for i := 0; i < 50; i++ {

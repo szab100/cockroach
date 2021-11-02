@@ -11,6 +11,8 @@
 import _ from "lodash";
 
 import * as protos from "src/js/protos";
+import { cockroach } from "src/js/protos";
+import INodeResponse = cockroach.server.serverpb.INodeResponse;
 
 export type INodeStatus = protos.cockroach.server.status.statuspb.INodeStatus;
 const nodeStatus: INodeStatus = null;
@@ -22,14 +24,11 @@ export type StatusMetrics = typeof nodeStatus.metrics;
  * collections are accumulated into the first StatusMetrics collection
  * passed.
  */
-export function AccumulateMetrics(
-  dest: StatusMetrics,
-  ...srcs: StatusMetrics[]
-): void {
+export function AccumulateMetrics(dest: StatusMetrics, ...srcs: StatusMetrics[]): void {
   srcs.forEach((s: StatusMetrics) => {
     _.forEach(s, (val: number, key: string) => {
       if (_.has(dest, key)) {
-        dest[key] = dest[key] + val;
+        dest[key] =  dest[key] + val;
       } else {
         dest[key] = val;
       }
@@ -42,18 +41,14 @@ export function AccumulateMetrics(
  * metrics collection of the supplied NodeStatus object. This is convenient
  * for all current usages of NodeStatus in the UI.
  */
-export function RollupStoreMetrics(ns: INodeStatus): void {
-  AccumulateMetrics(
-    ns.metrics,
-    ..._.map(ns.store_statuses, (ss) => ss.metrics),
-  );
+export function RollupStoreMetrics(ns: INodeResponse): void {
+  AccumulateMetrics(ns.metrics, ..._.map(ns.store_statuses, ss => ss.metrics));
 }
 
 /**
  * MetricConstants contains the name of several stats provided by
  * CockroachDB.
  */
-// eslint-disable-next-line @typescript-eslint/no-namespace
 export namespace MetricConstants {
   // Store level metrics.
   export const replicas: string = "replicas";
@@ -61,7 +56,7 @@ export namespace MetricConstants {
   export const leaseHolders: string = "replicas.leaseholders";
   export const ranges: string = "ranges";
   export const unavailableRanges: string = "ranges.unavailable";
-  export const underReplicatedRanges: string = "ranges.underreplicated";
+  export const underReplicatedRanges: string  = "ranges.underreplicated";
   export const liveBytes: string = "livebytes";
   export const keyBytes: string = "keybytes";
   export const valBytes: string = "valbytes";
@@ -92,10 +87,7 @@ export namespace MetricConstants {
  */
 export function TotalCpu(status: INodeStatus): number {
   const metrics = status.metrics;
-  return (
-    metrics[MetricConstants.sysCPUPercent] +
-    metrics[MetricConstants.userCPUPercent]
-  );
+  return metrics[MetricConstants.sysCPUPercent] + metrics[MetricConstants.userCPUPercent];
 }
 
 /**
