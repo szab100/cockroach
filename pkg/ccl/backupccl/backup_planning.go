@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net/url"
 	"path"
+	"sort"
 	"strconv"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -22,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupresolver"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
-	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -30,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -44,24 +43,25 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/interval"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
-	pbtypes "github.com/gogo/protobuf/types"
 )
 
 const (
 	backupOptRevisionHistory    = "revision_history"
-	backupOptIncludeInterleaves = "include_deprecated_interleaves"
 	backupOptEncPassphrase      = "encryption_passphrase"
+	backupOptIncludeInterleaves = "include_deprecated_interleaves"
 	backupOptEncKMS             = "kms"
 	backupOptWithPrivileges     = "privileges"
 	backupOptAsJSON             = "as_json"
-	backupOptWithDebugIDs       = "debug_ids"
 	localityURLParam            = "COCKROACH_LOCALITY"
 	defaultLocalityValue        = "default"
 )
@@ -152,49 +152,202 @@ func (e *encryptedDataKeyMap) rangeOverMap(fn func(masterKeyID hashedMasterKeyID
 	}
 }
 
-// getPublicIndexTableSpans returns all the public index spans of the
-// provided table.
-func getPublicIndexTableSpans(
-	table catalog.TableDescriptor, added map[tableAndIndex]bool, codec keys.SQLCodec,
+type sortedIndexIDs []descpb.IndexID
+
+func (s sortedIndexIDs) Less(i, j int) bool {
+	return s[i] < s[j]
+}
+
+func (s sortedIndexIDs) Swap(i, j int) {
+	s[i], s[j] = s[j], s[i]
+}
+
+func (s sortedIndexIDs) Len() int {
+	return len(s)
+}
+
+// getLogicallyMergedTableSpans returns all the non-drop index spans of the
+// provided table but after merging them so as to minimize the number of spans
+// generated. The following rules are used to logically merge the sorted set of
+// non-drop index spans:
+// - Contiguous index spans are merged.
+// - Two non-contiguous index spans are merged if a scan request for the index
+// IDs between them does not return any results.
+//
+// Egs: {/Table/51/1 - /Table/51/2}, {/Table/51/3 - /Table/51/4} => {/Table/51/1 - /Table/51/4}
+// provided the dropped index represented by the span
+// {/Table/51/2 - /Table/51/3} has been gc'ed.
+func getLogicallyMergedTableSpans(
+	ctx context.Context,
+	table catalog.TableDescriptor,
+	added map[tableAndIndex]bool,
+	codec keys.SQLCodec,
+	endTime hlc.Timestamp,
+	checkForKVInBounds func(start, end roachpb.Key, endTime hlc.Timestamp) (bool, error),
 ) ([]roachpb.Span, error) {
-	publicIndexSpans := make([]roachpb.Span, 0)
-	if err := catalog.ForEachActiveIndex(table, func(idx catalog.Index) error {
+	// Spans with adding indexes are not safe to include in the backup since
+	// they may see non-transactional AddSST traffic. Future incremental backups
+	// will not have a way of incrementally backing up the data until #62585 is
+	// resolved.
+	addingIndexIDs := make(map[descpb.IndexID]struct{})
+	var publicIndexIDs []descpb.IndexID
+
+	allPhysicalIndexOpts := catalog.IndexOpts{DropMutations: true, AddMutations: true}
+	if err := catalog.ForEachIndex(table, allPhysicalIndexOpts, func(idx catalog.Index) error {
 		key := tableAndIndex{tableID: table.GetID(), indexID: idx.GetID()}
 		if added[key] {
 			return nil
 		}
 		added[key] = true
-		publicIndexSpans = append(publicIndexSpans, table.IndexSpan(codec, idx.GetID()))
+		if idx.Public() {
+			publicIndexIDs = append(publicIndexIDs, idx.GetID())
+		}
+		if idx.Adding() {
+			addingIndexIDs[idx.GetID()] = struct{}{}
+		}
 		return nil
 	}); err != nil {
 		return nil, err
 	}
 
-	return publicIndexSpans, nil
+	if len(publicIndexIDs) == 0 {
+		return nil, nil
+	}
+
+	// There is no merging possible with only a single index, short circuit.
+	if len(publicIndexIDs) == 1 {
+		return []roachpb.Span{table.IndexSpan(codec, publicIndexIDs[0])}, nil
+	}
+
+	sort.Sort(sortedIndexIDs(publicIndexIDs))
+
+	var mergedIndexSpans []roachpb.Span
+
+	// mergedSpan starts off as the first span in the set of spans being
+	// considered for a logical merge.
+	// The logical span merge algorithm walks over the table's non drop indexes
+	// using an lhsSpan and rhsSpan  (always offset by 1). It checks all index IDs
+	// between lhsSpan and rhsSpan to look for dropped but non-gced KVs. The
+	// existence of such a KV indicates that the rhsSpan cannot be included in the
+	// current set of spans being logically merged, and so we update the
+	// mergedSpan to encompass the lhsSpan as that is the furthest we can go.
+	// After recording the new "merged" span, we update mergedSpan to be the
+	// rhsSpan, and start processing the next logically mergeable span set.
+	mergedSpan := table.IndexSpan(codec, publicIndexIDs[0])
+	for curIndex := 0; curIndex < len(publicIndexIDs)-1; curIndex++ {
+		lhsIndexID := publicIndexIDs[curIndex]
+		rhsIndexID := publicIndexIDs[curIndex+1]
+
+		lhsSpan := table.IndexSpan(codec, lhsIndexID)
+		rhsSpan := table.IndexSpan(codec, rhsIndexID)
+
+		lhsIndex, err := table.FindIndexWithID(lhsIndexID)
+		if err != nil {
+			return nil, err
+		}
+		rhsIndex, err := table.FindIndexWithID(rhsIndexID)
+		if err != nil {
+			return nil, err
+		}
+
+		// If either the lhs or rhs is an interleaved index, we do not attempt to
+		// perform a logical merge of the spans because the index span for
+		// interleaved contains the tableID/indexID of the furthest ancestor in
+		// the interleaved chain.
+		if lhsIndex.IsInterleaved() || rhsIndex.IsInterleaved() {
+			mergedIndexSpans = append(mergedIndexSpans, mergedSpan)
+			mergedSpan = rhsSpan
+		} else {
+			var foundDroppedKV bool
+			// Iterate over all index IDs between the two candidates (lhs and
+			// rhs) which may be logically merged. These index IDs represent
+			// non-public (and perhaps dropped) indexes between the two public
+			// index spans.
+			for i := lhsIndexID + 1; i < rhsIndexID; i++ {
+				// If we find an index which has been dropped but not gc'ed, we
+				// cannot merge the lhs and rhs spans.
+				foundDroppedKV, err = checkForKVInBounds(lhsSpan.EndKey, rhsSpan.Key, endTime)
+				if err != nil {
+					// If we're unable to check for KVs in bounds, assume that we've found
+					// one. It's always safe to assume that since we won't merge over this
+					// span. One possible error is a GC threshold error if this schema
+					// revision is older than the configured GC window on the span we're
+					// checking.
+					log.Warningf(ctx, "error while scanning [%s, %s) @ %v: %v",
+						lhsSpan.EndKey, rhsSpan.Key, endTime, err)
+					foundDroppedKV = true
+				}
+				// If we find an index that is being added, don't merge the spans. We
+				// don't want to backup data that is being backfilled until the backfill
+				// is complete. Even if the backfill has not started yet and there is no
+				// data we should not back up this span since we want these spans to
+				// appear as introduced when the index becomes PUBLIC.
+				// The indexes will appear in introduced spans because indexes
+				// will never go from PUBLIC to ADDING.
+				_, foundAddingIndex := addingIndexIDs[i]
+				if foundDroppedKV || foundAddingIndex {
+					mergedSpan.EndKey = lhsSpan.EndKey
+					mergedIndexSpans = append(mergedIndexSpans, mergedSpan)
+					mergedSpan = rhsSpan
+					break
+				}
+			}
+		}
+
+		// The loop will terminate after this iteration and so we must update the
+		// current mergedSpan to encompass the last element in the indexIDs
+		// slice as well.
+		if curIndex == len(publicIndexIDs)-2 {
+			mergedSpan.EndKey = rhsSpan.EndKey
+			mergedIndexSpans = append(mergedIndexSpans, mergedSpan)
+		}
+	}
+
+	return mergedIndexSpans, nil
 }
 
 // spansForAllTableIndexes returns non-overlapping spans for every index and
 // table passed in. They would normally overlap if any of them are interleaved.
-// Overlapping index spans are merged so as to optimize the size/number of the
-// spans we BACKUP and lay protected ts records for.
+// The outputted spans are merged as described by the method
+// getLogicallyMergedTableSpans, so as to optimize the size/number of the spans
+// we BACKUP and lay protected ts records for.
 func spansForAllTableIndexes(
+	ctx context.Context,
 	execCfg *sql.ExecutorConfig,
+	endTime hlc.Timestamp,
 	tables []catalog.TableDescriptor,
 	revs []BackupManifest_DescriptorRevision,
 ) ([]roachpb.Span, error) {
 
 	added := make(map[tableAndIndex]bool, len(tables))
 	sstIntervalTree := interval.NewTree(interval.ExclusiveOverlapper)
-	var publicIndexSpans []roachpb.Span
+	var mergedIndexSpans []roachpb.Span
 	var err error
 
+	// checkForKVInBounds issues a scan request between start and end at endTime,
+	// and returns true if a non-nil result is returned.
+	checkForKVInBounds := func(start, end roachpb.Key, endTime hlc.Timestamp) (bool, error) {
+		var foundKV bool
+		err := execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			txn.SetFixedTimestamp(ctx, endTime)
+			res, err := txn.Scan(ctx, start, end, 1 /* maxRows */)
+			if err != nil {
+				return err
+			}
+			foundKV = len(res) != 0
+			return nil
+		})
+		return foundKV, err
+	}
+
 	for _, table := range tables {
-		publicIndexSpans, err = getPublicIndexTableSpans(table, added, execCfg.Codec)
+		mergedIndexSpans, err = getLogicallyMergedTableSpans(ctx, table, added, execCfg.Codec, endTime,
+			checkForKVInBounds)
 		if err != nil {
 			return nil, err
 		}
 
-		for _, indexSpan := range publicIndexSpans {
+		for _, indexSpan := range mergedIndexSpans {
 			if err := sstIntervalTree.Insert(intervalSpan(indexSpan), false); err != nil {
 				panic(errors.NewAssertionErrorWithWrappedErrf(err, "IndexSpan"))
 			}
@@ -209,15 +362,16 @@ func spansForAllTableIndexes(
 		// state. We want (and do) ignore tables that have been dropped for the
 		// entire interval. DROPPED tables should never later become PUBLIC.
 		rawTbl, _, _, _ := descpb.FromDescriptor(rev.Desc)
-		if rawTbl != nil && rawTbl.Public() {
+		if rawTbl != nil && rawTbl.State == descpb.DescriptorState_PUBLIC {
 			tbl := tabledesc.NewBuilder(rawTbl).BuildImmutableTable()
-			revSpans, err := getPublicIndexTableSpans(tbl, added, execCfg.Codec)
+			revSpans, err := getLogicallyMergedTableSpans(ctx, tbl, added, execCfg.Codec, rev.Time,
+				checkForKVInBounds)
 			if err != nil {
 				return nil, err
 			}
 
-			publicIndexSpans = append(publicIndexSpans, revSpans...)
-			for _, indexSpan := range publicIndexSpans {
+			mergedIndexSpans = append(mergedIndexSpans, revSpans...)
+			for _, indexSpan := range mergedIndexSpans {
 				if err := sstIntervalTree.Insert(intervalSpan(indexSpan), false); err != nil {
 					panic(errors.NewAssertionErrorWithWrappedErrf(err, "IndexSpan"))
 				}
@@ -237,7 +391,7 @@ func spansForAllTableIndexes(
 	// Attempt to merge any contiguous spans generated from the tables and revs.
 	// No need to check if the spans are distinct, since some of the merged
 	// indexes may overlap between different revisions of the same descriptor.
-	mergedSpans, _ := roachpb.MergeSpans(&spans)
+	mergedSpans, _ := roachpb.MergeSpans(spans)
 
 	knobs := execCfg.BackupRestoreTestingKnobs
 	if knobs != nil && knobs.CaptureResolvedTableDescSpans != nil {
@@ -334,7 +488,7 @@ func resolveOptionsForBackupJobDescription(
 	}
 
 	for _, uri := range kmsURIs {
-		redactedURI, err := cloud.RedactKMSURI(uri)
+		redactedURI, err := cloudimpl.RedactKMSURI(uri)
 		if err != nil {
 			return tree.BackupOptions{}, err
 		}
@@ -373,7 +527,7 @@ func GetRedactedBackupNode(
 	}
 
 	for _, t := range to {
-		sanitizedTo, err := cloud.SanitizeExternalStorageURI(t, nil /* extraParams */)
+		sanitizedTo, err := cloudimpl.SanitizeExternalStorageURI(t, nil /* extraParams */)
 		if err != nil {
 			return nil, err
 		}
@@ -381,7 +535,7 @@ func GetRedactedBackupNode(
 	}
 
 	for _, from := range incrementalFrom {
-		sanitizedFrom, err := cloud.SanitizeExternalStorageURI(from, nil /* extraParams */)
+		sanitizedFrom, err := cloudimpl.SanitizeExternalStorageURI(from, nil /* extraParams */)
 		if err != nil {
 			return nil, err
 		}
@@ -518,18 +672,7 @@ func checkPrivilegesForBackup(
 	}
 	for _, desc := range targetDescs {
 		switch desc := desc.(type) {
-		case catalog.DatabaseDescriptor:
-			if connectErr := p.CheckPrivilege(ctx, desc, privilege.CONNECT); connectErr != nil {
-				// SELECT is being deprecated as privilege on Databases in 22.1.
-				// In the meanwhile, we still allow backup if the user has SELECT.
-				// TODO(richardjcai): Remove this check for SELECT in 22.1.
-				if selectErr := p.CheckPrivilege(ctx, desc, privilege.SELECT); selectErr != nil {
-					// Return the connectErr as we want users to grant CONNECT to perform
-					// this backup and not select.
-					return connectErr
-				}
-			}
-		case catalog.TableDescriptor:
+		case catalog.DatabaseDescriptor, catalog.TableDescriptor:
 			if err := p.CheckPrivilege(ctx, desc, privilege.SELECT); err != nil {
 				return err
 			}
@@ -544,15 +687,15 @@ func checkPrivilegesForBackup(
 	}
 	// Check that none of the destinations require an admin role.
 	for _, uri := range to {
-		conf, err := cloud.ExternalStorageConfFromURI(uri, p.User())
+		hasExplicitAuth, uriScheme, err := cloud.AccessIsWithExplicitAuth(uri)
 		if err != nil {
 			return err
 		}
-		if !conf.AccessIsWithExplicitAuth() {
+		if !hasExplicitAuth {
 			return pgerror.Newf(
 				pgcode.InsufficientPrivilege,
 				"only users with the admin role are allowed to BACKUP to the specified %s URI",
-				conf.Provider.String())
+				uriScheme)
 		}
 	}
 
@@ -678,11 +821,10 @@ func backupPlanHook(
 
 		endTime := p.ExecCfg().Clock.Now()
 		if backupStmt.AsOf.Expr != nil {
-			asOf, err := p.EvalAsOfTimestamp(ctx, backupStmt.AsOf)
-			if err != nil {
+			var err error
+			if endTime, err = p.EvalAsOfTimestamp(ctx, backupStmt.AsOf); err != nil {
 				return err
 			}
-			endTime = asOf.Timestamp
 		}
 
 		defaultURI, urisByLocalityKV, err := getURIsByLocalityKV(to, "")
@@ -838,48 +980,72 @@ func backupPlanHook(
 		}
 
 		var spans []roachpb.Span
-		var tenants []descpb.TenantInfoWithUsage
+		var tenantRows []tree.Datums
 		if backupStmt.Targets != nil && backupStmt.Targets.Tenant != (roachpb.TenantID{}) {
 			if !p.ExecCfg().Codec.ForSystemTenant() {
 				return pgerror.Newf(pgcode.InsufficientPrivilege, "only the system tenant can backup other tenants")
 			}
 
-			tenantInfo, err := retrieveSingleTenantMetadata(
-				ctx, p.ExecCfg().InternalExecutor, p.ExtendedEvalContext().Txn, backupStmt.Targets.Tenant,
+			tenID := backupStmt.Targets.Tenant
+			id := backupStmt.Targets.Tenant.ToUint64()
+			ds, err := p.ExecCfg().InternalExecutor.QueryRow(
+				ctx, "backup-lookup-tenant", p.ExtendedEvalContext().Txn,
+				`SELECT id, active, info FROM system.tenants WHERE id = $1`, id,
 			)
+
 			if err != nil {
 				return err
 			}
-			tenants = []descpb.TenantInfoWithUsage{tenantInfo}
+
+			if ds == nil {
+				return errors.Errorf("tenant %s does not exist", tenID)
+			}
+
+			if !tree.MustBeDBool(ds[1]) {
+				return errors.Errorf("tenant %d is not active", id)
+			}
+
+			tenantRows = append(tenantRows, ds)
 		} else {
-			tableSpans, err := spansForAllTableIndexes(p.ExecCfg(), tables, revs)
+			tableSpans, err := spansForAllTableIndexes(ctx, p.ExecCfg(), endTime, tables, revs)
 			if err != nil {
 				return err
 			}
 			spans = append(spans, tableSpans...)
 
-			if p.ExecCfg().Codec.ForSystemTenant() {
-				// Include all tenants.
-				tenants, err = retrieveAllTenantsMetadata(
-					ctx, p.ExecCfg().InternalExecutor, p.ExtendedEvalContext().Txn,
-				)
-				if err != nil {
-					return err
-				}
+			// Include all tenants.
+			// TODO(tbg): make conditional on cluster setting.
+			tenantRows, err = p.ExecCfg().InternalExecutor.QueryBuffered(
+				ctx, "backup-lookup-tenant", p.ExtendedEvalContext().Txn,
+				`SELECT id, active, info FROM system.tenants`,
+			)
+
+			if err != nil {
+				return err
 			}
 		}
 
-		if len(tenants) > 0 {
-			if backupStmt.Options.CaptureRevisionHistory {
-				return errors.UnimplementedError(
-					errors.IssueLink{IssueURL: "https://github.com/cockroachdb/cockroach/issues/47896"},
-					"can not backup tenants with revision history",
-				)
+		var tenants []descpb.TenantInfo
+		for _, row := range tenantRows {
+			// TODO isn't there a general problem here with tenant IDs > MaxInt64?
+			id := uint64(tree.MustBeDInt(row[0]))
+
+			info := descpb.TenantInfo{ID: id}
+			infoBytes := []byte(tree.MustBeDBytes(row[2]))
+			if err := protoutil.Unmarshal(infoBytes, &info); err != nil {
+				return err
 			}
-			for i := range tenants {
-				prefix := keys.MakeTenantPrefix(roachpb.MakeTenantID(tenants[i].ID))
-				spans = append(spans, roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()})
-			}
+			tenants = append(tenants, info)
+
+			prefix := keys.MakeTenantPrefix(roachpb.MakeTenantID(id))
+			spans = append(spans, roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()})
+		}
+
+		if len(tenants) > 0 && backupStmt.Options.CaptureRevisionHistory {
+			return errors.UnimplementedError(
+				errors.IssueLink{IssueURL: "https://github.com/cockroachdb/cockroach/issues/47896"},
+				"can not backup tenants with revision history",
+			)
 		}
 
 		if len(prevBackups) > 0 {
@@ -1003,6 +1169,12 @@ func backupPlanHook(
 		if err := checkForPreviousBackup(ctx, defaultStore, defaultURI); err != nil {
 			return err
 		}
+		// TODO (pbardea): For partitioned backups, also add verification for other
+		// stores we are writing to in addition to the default.
+		baseURI := collectionURI
+		if baseURI == "" {
+			baseURI = defaultURI
+		}
 
 		// Write backup manifest into a temporary checkpoint file.
 		// This accomplishes 2 purposes:
@@ -1010,9 +1182,6 @@ func backupPlanHook(
 		//  2. Verifies we can write to destination location.
 		// This temporary checkpoint file gets renamed to real checkpoint
 		// file when the backup jobs starts execution.
-		//
-		// TODO (pbardea): For partitioned backups, also add verification for other
-		// stores we are writing to in addition to the default.
 		doWriteBackupManifestCheckpoint := func(ctx context.Context, jobID jobspb.JobID) error {
 			if err := writeBackupManifest(
 				ctx, p.ExecCfg().Settings, defaultStore, tempCheckpointFileNameForJob(jobID),
@@ -1032,11 +1201,6 @@ func backupPlanHook(
 			EncryptionInfo:    encryptionInfo,
 			CollectionURI:     collectionURI,
 		}
-
-		if err := planSchedulePTSChaining(ctx, p, &backupDetails, backupStmt); err != nil {
-			return err
-		}
-
 		if len(spans) > 0 && p.ExecCfg().Codec.ForSystemTenant() {
 			protectedtsID := uuid.MakeV4()
 			backupDetails.ProtectedTimestampRecord = &protectedtsID
@@ -1148,39 +1312,24 @@ func backupPlanHook(
 			return nil
 		}
 
-		// We create the job record in the planner's transaction to ensure that
-		// the job record creation happens transactionally.
-		plannerTxn := p.ExtendedEvalContext().Txn
-
-		// Construct the job and commit the transaction. Perform this work in a
-		// closure to ensure that the job is cleaned up if an error occurs.
 		var sj *jobs.StartableJob
-		if err := func() (err error) {
-			defer func() {
-				if err == nil || sj == nil {
-					return
-				}
-				if cleanupErr := sj.CleanupOnRollback(ctx); cleanupErr != nil {
-					log.Errorf(ctx, "failed to cleanup job: %v", cleanupErr)
-				}
-			}()
-			jobID := p.ExecCfg().JobRegistry.MakeJobID()
-			if err := p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, &sj, jobID, plannerTxn, jr); err != nil {
+		jobID := p.ExecCfg().JobRegistry.MakeJobID()
+		if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
+			if err := p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, &sj, jobID, txn, jr); err != nil {
 				return err
 			}
 			if err := doWriteBackupManifestCheckpoint(ctx, jobID); err != nil {
 				return err
 			}
-			if err := protectTimestampForBackup(ctx, p, plannerTxn, jobID, spans, startTime, endTime, backupDetails); err != nil {
-				return err
-			}
 
-			// We commit the transaction here so that the job can be started. This
-			// is safe because we're in an implicit transaction. If we were in an
-			// explicit transaction the job would have to be run with the detached
-			// option and would have been handled above.
-			return plannerTxn.Commit(ctx)
-		}(); err != nil {
+			return protectTimestampForBackup(ctx, p, txn, jobID, spans, startTime, endTime,
+				backupDetails)
+		}); err != nil {
+			if sj != nil {
+				if cleanupErr := sj.CleanupOnRollback(ctx); cleanupErr != nil {
+					log.Warningf(ctx, "failed to cleanup StartableJob: %v", cleanupErr)
+				}
+			}
 			return err
 		}
 
@@ -1198,108 +1347,6 @@ func backupPlanHook(
 		return fn, utilccl.DetachedJobExecutionResultHeader, nil, false, nil
 	}
 	return fn, utilccl.BulkJobExecutionResultHeader, nil, false, nil
-}
-
-func getScheduledBackupExecutionArgsFromSchedule(
-	ctx context.Context,
-	env scheduledjobs.JobSchedulerEnv,
-	txn *kv.Txn,
-	ie *sql.InternalExecutor,
-	scheduleID int64,
-) (*jobs.ScheduledJob, *ScheduledBackupExecutionArgs, error) {
-	// Load the schedule that has spawned this job.
-	sj, err := jobs.LoadScheduledJob(ctx, env, scheduleID, ie, txn)
-	if err != nil {
-		return nil, nil, errors.Wrapf(err, "failed to load scheduled job %d", scheduleID)
-	}
-
-	args := &ScheduledBackupExecutionArgs{}
-	if err := pbtypes.UnmarshalAny(sj.ExecutionArgs().Args, args); err != nil {
-		return nil, nil, errors.Wrap(err, "un-marshaling args")
-	}
-
-	return sj, args, nil
-}
-
-// planSchedulePTSChaining populates backupDetails with information relevant to
-// the chaining of protected timestamp records between scheduled backups.
-// Depending on whether backupStmt is a full or incremental backup, we populate
-// relevant fields that are used to perform this chaining, on successful
-// completion of the backup job.
-func planSchedulePTSChaining(
-	ctx context.Context,
-	p sql.PlanHookState,
-	backupDetails *jobspb.BackupDetails,
-	backupStmt *annotatedBackupStatement,
-) error {
-	env := scheduledjobs.ProdJobSchedulerEnv
-	if knobs, ok := p.ExecCfg().DistSQLSrv.TestingKnobs.JobsTestingKnobs.(*jobs.TestingKnobs); ok {
-		if knobs.JobSchedulerEnv != nil {
-			env = knobs.JobSchedulerEnv
-		}
-	}
-	// If this is not a scheduled backup, we do not chain pts records.
-	if backupStmt.CreatedByInfo == nil || backupStmt.CreatedByInfo.Name != jobs.CreatedByScheduledJobs {
-		return nil
-	}
-
-	_, args, err := getScheduledBackupExecutionArgsFromSchedule(ctx, env,
-		p.ExtendedEvalContext().Txn, p.ExecCfg().InternalExecutor, backupStmt.CreatedByInfo.ID)
-	if err != nil {
-		return err
-	}
-	if !args.ChainProtectedTimestampRecords {
-		return nil
-	}
-
-	if args.BackupType == ScheduledBackupExecutionArgs_FULL {
-		// Check if there is a dependent incremental schedule associated with the
-		// full schedule running the current backup.
-		// If present, the full backup on successful completion, will release the
-		// pts record found on the incremental schedule, and replace it with a new
-		// pts record protecting after the EndTime of the full backup.
-		if args.DependentScheduleID == 0 {
-			return nil
-		}
-
-		_, incArgs, err := getScheduledBackupExecutionArgsFromSchedule(ctx, env,
-			p.ExtendedEvalContext().Txn, p.ExecCfg().InternalExecutor, args.DependentScheduleID)
-		if err != nil {
-			// If we are unable to resolve the dependent incremental schedule (it
-			// could have been dropped) we do not need to perform any chaining.
-			//
-			// TODO(adityamaru): Update this comment when DROP SCHEDULE is taught
-			// to clear the dependent ID. Once that is done, we should not encounter
-			// this error.
-			if jobs.HasScheduledJobNotFoundError(err) {
-				log.Warningf(ctx, "could not find dependent schedule with id %d",
-					args.DependentScheduleID)
-				return nil
-			}
-			return err
-		}
-		backupDetails.SchedulePTSChainingRecord = &jobspb.SchedulePTSChainingRecord{
-			ProtectedTimestampRecord: incArgs.ProtectedTimestampRecord,
-			Action:                   jobspb.SchedulePTSChainingRecord_RELEASE,
-		}
-	} else {
-		// In the case of a scheduled incremental backup we save the pts record id
-		// that the job should update on successful completion, to protect data
-		// after the current backups' EndTime.
-		// We save this information on the job instead of reading it from the
-		// schedule on completion, so as to prevent an "overhang" incremental from
-		// incorrectly pulling forward a pts record that was written by a new full
-		// backup that completed while the incremental was still executing.
-		//
-		// NB: An overhang incremental is defined as a scheduled incremental backup
-		// that appends to the old full backup chain, and completes after a new full
-		// backup has started another chain.
-		backupDetails.SchedulePTSChainingRecord = &jobspb.SchedulePTSChainingRecord{
-			ProtectedTimestampRecord: args.ProtectedTimestampRecord,
-			Action:                   jobspb.SchedulePTSChainingRecord_UPDATE,
-		}
-	}
-	return nil
 }
 
 // getReintroducedSpans checks to see if any spans need to be re-backed up from
@@ -1366,7 +1413,7 @@ func getReintroducedSpans(
 		}
 	}
 
-	tableSpans, err := spansForAllTableIndexes(p.ExecCfg(), tablesToReinclude, allRevs)
+	tableSpans, err := spansForAllTableIndexes(ctx, p.ExecCfg(), endTime, tablesToReinclude, allRevs)
 	if err != nil {
 		return nil, err
 	}
@@ -1435,8 +1482,8 @@ func protectTimestampForBackup(
 		if !startTime.IsEmpty() {
 			tsToProtect = startTime
 		}
-		rec := jobsprotectedts.MakeRecord(*backupDetails.ProtectedTimestampRecord, int64(jobID),
-			tsToProtect, spans, jobsprotectedts.Jobs)
+		rec := jobsprotectedts.MakeRecord(*backupDetails.ProtectedTimestampRecord, jobID,
+			tsToProtect, spans)
 		err := p.ExecCfg().ProtectedTimestampProvider.Protect(ctx, txn, rec)
 		if err != nil {
 			return err
