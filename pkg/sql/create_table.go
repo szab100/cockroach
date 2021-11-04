@@ -19,7 +19,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -210,73 +209,9 @@ func getSchemaForCreateTable(
 
 	return schema, nil
 }
-func hasPrimaryKeySerialType(params runParams, colDef *tree.ColumnTableDef) (bool, error) {
-	if colDef.IsSerial || colDef.GeneratedIdentity.IsGeneratedAsIdentity {
-		return true, nil
-	}
-
-	if funcExpr, ok := colDef.DefaultExpr.Expr.(*tree.FuncExpr); ok {
-		var name string
-
-		switch t := funcExpr.Func.FunctionReference.(type) {
-		case *tree.FunctionDefinition:
-			name = t.Name
-		case *tree.UnresolvedName:
-			fn, err := t.ResolveFunction(params.SessionData().SearchPath)
-			if err != nil {
-				return false, err
-			}
-			name = fn.Name
-		}
-
-		if name == "nextval" {
-			return true, nil
-		}
-	}
-
-	return false, nil
-}
 
 func (n *createTableNode) startExec(params runParams) error {
 	telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter("table"))
-
-	colsWithPrimaryKeyConstraint := make(map[tree.Name]bool)
-
-	for _, def := range n.n.Defs {
-		switch v := def.(type) {
-		case *tree.UniqueConstraintTableDef:
-			if v.PrimaryKey {
-				for _, indexEle := range v.IndexTableDef.Columns {
-					colsWithPrimaryKeyConstraint[indexEle.Column] = true
-				}
-			}
-
-		case *tree.ColumnTableDef:
-			if v.PrimaryKey.IsPrimaryKey {
-				colsWithPrimaryKeyConstraint[v.Name] = true
-			}
-		}
-	}
-
-	for _, def := range n.n.Defs {
-		switch v := def.(type) {
-		case *tree.ColumnTableDef:
-			if _, ok := colsWithPrimaryKeyConstraint[v.Name]; ok {
-				primaryKeySerial, err := hasPrimaryKeySerialType(params, v)
-				if err != nil {
-					return err
-				}
-
-				if primaryKeySerial {
-					params.p.BufferClientNotice(
-						params.ctx,
-						pgnotice.Newf("using sequential values in a primary key does not perform as well as using random UUIDs. See %s", docs.URL("serial.html")),
-					)
-					break
-				}
-			}
-		}
-	}
 
 	schema, err := getSchemaForCreateTable(params, n.dbDesc, n.n.Persistence, &n.n.Table,
 		tree.ResolveRequireTableDesc, n.n.IfNotExists)
@@ -544,7 +479,7 @@ func (n *createTableNode) startExec(params runParams) error {
 				*ti = tableInserter{}
 				tableInserterPool.Put(ti)
 			}()
-			if err := tw.init(params.ctx, params.p.txn, params.p.EvalContext(), &params.p.EvalContext().Settings.SV); err != nil {
+			if err := tw.init(params.ctx, params.p.txn, params.p.EvalContext()); err != nil {
 				return err
 			}
 
@@ -960,7 +895,7 @@ func ResolveFK(
 	constraintName := string(d.Name)
 	if constraintName == "" {
 		constraintName = tabledesc.GenerateUniqueName(
-			tabledesc.ForeignKeyConstraintName(tbl.GetName(), d.FromCols.ToStrings()),
+			fmt.Sprintf("fk_%s_ref_%s", string(d.FromCols[0]), target.Name),
 			func(p string) bool {
 				_, ok := constraintInfo[p]
 				return ok
@@ -1255,9 +1190,7 @@ var CreatePartitioningCCL = func(
 		"creating or manipulating partitions requires a CCL binary"))
 }
 
-func getFinalSourceQuery(
-	params runParams, source *tree.Select, evalCtx *tree.EvalContext,
-) (string, error) {
+func getFinalSourceQuery(source *tree.Select, evalCtx *tree.EvalContext) string {
 	// Ensure that all the table names pretty-print as fully qualified, so we
 	// store that in the table descriptor.
 	//
@@ -1296,13 +1229,7 @@ func getFinalSourceQuery(
 	)
 	ctx.FormatNode(source)
 
-	// Use IDs instead of sequence names because name resolution depends on
-	// session data, and the internal executor has different session data.
-	sequenceReplacedQuery, err := replaceSeqNamesWithIDs(params.ctx, params.p, ctx.CloseAndGetString())
-	if err != nil {
-		return "", err
-	}
-	return sequenceReplacedQuery, nil
+	return ctx.CloseAndGetString()
 }
 
 // newTableDescIfAs is the NewTableDesc method for when we have a table
@@ -1361,11 +1288,7 @@ func newTableDescIfAs(
 	if err != nil {
 		return nil, err
 	}
-	createQuery, err := getFinalSourceQuery(params, p.AsSource, evalContext)
-	if err != nil {
-		return nil, err
-	}
-	desc.CreateQuery = createQuery
+	desc.CreateQuery = getFinalSourceQuery(p.AsSource, evalContext)
 	return desc, nil
 }
 
@@ -1430,7 +1353,7 @@ func NewTableDesc(
 ) (*tabledesc.Mutable, error) {
 	// Used to delay establishing Column/Sequence dependency until ColumnIDs have
 	// been populated.
-	cdd := make([]*tabledesc.ColumnDefDescs, len(n.Defs))
+	columnDefaultExprs := make([]tree.TypedExpr, len(n.Defs))
 
 	var opts newTableDescOptions
 	for _, o := range inOpts {
@@ -1575,7 +1498,7 @@ func NewTableDesc(
 					maybeRegionalByRowOnUpdateExpr(evalCtx, oid),
 				),
 			)
-			cdd = append(cdd, nil)
+			columnDefaultExprs = append(columnDefaultExprs, nil)
 		}
 
 		// Construct the partitioning for the PARTITION ALL BY.
@@ -1689,18 +1612,16 @@ func NewTableDesc(
 				// It'll then be added to this table's resulting table descriptor below in
 				// the constraint pass.
 				n.Defs = append(n.Defs, checkConstraint)
-				cdd = append(cdd, nil)
+				columnDefaultExprs = append(columnDefaultExprs, nil)
 			}
 			if d.IsVirtual() && d.HasColumnFamily() {
 				return nil, pgerror.Newf(pgcode.Syntax, "virtual columns cannot have family specifications")
 			}
 
-			cdd[i], err = tabledesc.MakeColumnDefDescs(ctx, d, semaCtx, evalCtx)
+			col, idx, expr, err := tabledesc.MakeColumnDefDescs(ctx, d, semaCtx, evalCtx)
 			if err != nil {
 				return nil, err
 			}
-			col := cdd[i].ColumnDescriptor
-			idx := cdd[i].PrimaryKeyOrUniqueIndexDescriptor
 
 			// Do not include virtual tables in these statistics.
 			if !descpb.IsVirtualTable(id) {
@@ -1708,6 +1629,12 @@ func NewTableDesc(
 			}
 
 			desc.AddColumn(col)
+			if d.HasDefaultExpr() {
+				// This resolution must be delayed until ColumnIDs have been populated.
+				columnDefaultExprs[i] = expr
+			} else {
+				columnDefaultExprs[i] = nil
+			}
 
 			if idx != nil {
 				idx.Version = indexEncodingVersion
@@ -1809,7 +1736,7 @@ func NewTableDesc(
 				return nil, err
 			}
 			n.Defs = append(n.Defs, checkConstraint)
-			cdd = append(cdd, nil)
+			columnDefaultExprs = append(columnDefaultExprs, nil)
 		}
 		return newColumns, nil
 	}
@@ -2217,19 +2144,14 @@ func NewTableDesc(
 	colIdx := 0
 	for i := range n.Defs {
 		if _, ok := n.Defs[i].(*tree.ColumnTableDef); ok {
-			if cdd[i] != nil {
-				if err := cdd[i].ForEachTypedExpr(func(expr tree.TypedExpr) error {
-					changedSeqDescs, err := maybeAddSequenceDependencies(
-						ctx, st, vt, &desc, &desc.Columns[colIdx], expr, affected)
-					if err != nil {
-						return err
-					}
-					for _, changedSeqDesc := range changedSeqDescs {
-						affected[changedSeqDesc.ID] = changedSeqDesc
-					}
-					return nil
-				}); err != nil {
+			if expr := columnDefaultExprs[i]; expr != nil {
+				changedSeqDescs, err := maybeAddSequenceDependencies(
+					ctx, st, vt, &desc, &desc.Columns[colIdx], expr, affected)
+				if err != nil {
 					return nil, err
+				}
+				for _, changedSeqDesc := range changedSeqDescs {
+					affected[changedSeqDesc.ID] = changedSeqDesc
 				}
 			}
 			colIdx++
@@ -2305,12 +2227,8 @@ func NewTableDesc(
 	// constructing the table descriptor so that we can check all foreign key
 	// constraints in on place as opposed to traversing the input and finding all
 	// inline/explicit foreign key constraints.
-	var onUpdateErr error
-	tabledesc.ValidateOnUpdate(&desc, func(err error) {
-		onUpdateErr = err
-	})
-	if onUpdateErr != nil {
-		return nil, onUpdateErr
+	if err := tabledesc.ValidateOnUpdate(desc.AllColumns(), desc.GetOutboundFKs()); err != nil {
+		return nil, err
 	}
 
 	// AllocateIDs mutates its receiver. `return desc, desc.AllocateIDs()`
@@ -2573,14 +2491,6 @@ func replaceLikeTableOpts(n *tree.CreateTable, params runParams) (tree.TableDefs
 					def.Computed.Computed = true
 					def.Computed.Virtual = c.Virtual
 					def.Computed.Expr, err = parser.ParseExpr(*c.ComputeExpr)
-					if err != nil {
-						return nil, err
-					}
-				}
-			}
-			if c.OnUpdateExpr != nil {
-				if opts.Has(tree.LikeTableOptDefaults) {
-					def.OnUpdateExpr.Expr, err = parser.ParseExpr(*c.OnUpdateExpr)
 					if err != nil {
 						return nil, err
 					}
@@ -2869,9 +2779,6 @@ func incTelemetryForNewColumn(def *tree.ColumnTableDef, desc *descpb.ColumnDescr
 		} else {
 			telemetry.Inc(sqltelemetry.SchemaNewColumnTypeQualificationCounter("unique"))
 		}
-	}
-	if desc.HasOnUpdate() {
-		telemetry.Inc(sqltelemetry.SchemaNewColumnTypeQualificationCounter("on_update"))
 	}
 }
 

@@ -228,10 +228,12 @@ func handleStreamErr(
 	flowCtxCancel, outboxCtxCancel context.CancelFunc,
 ) {
 	if err == io.EOF {
-		log.VEventf(ctx, 2, "Outbox calling outboxCtxCancel after %s EOF", opName)
+		if log.V(1) {
+			log.Infof(ctx, "Outbox calling outboxCtxCancel after %s EOF", opName)
+		}
 		outboxCtxCancel()
 	} else {
-		log.VEventf(ctx, 1, "Outbox calling flowCtxCancel after %s connection error: %+v", opName, err)
+		log.Warningf(ctx, "Outbox calling flowCtxCancel after %s connection error: %+v", opName, err)
 		flowCtxCancel()
 	}
 }
