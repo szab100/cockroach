@@ -29,9 +29,16 @@ func TestSafeMessage(t *testing.T) {
 	}{
 		{
 			desc: typedesc.NewBuilder(&descpb.TypeDescriptor{
-				Name:                     "foo",
-				ID:                       21,
-				Version:                  3,
+				Name:    "foo",
+				ID:      21,
+				Version: 3,
+				DrainingNames: []descpb.NameInfo{
+					{
+						ParentID:       2,
+						ParentSchemaID: 29,
+						Name:           "bar",
+					},
+				},
 				Privileges:               descpb.NewDefaultPrivilegeDescriptor(security.RootUserName()),
 				ParentID:                 2,
 				ParentSchemaID:           29,
@@ -40,15 +47,22 @@ func TestSafeMessage(t *testing.T) {
 				Kind:                     descpb.TypeDescriptor_ALIAS,
 				ReferencingDescriptorIDs: []descpb.ID{73, 37},
 			}).BuildImmutableType(),
-			exp: `typedesc.immutable: {ID: 21, Version: 3, ModificationTime: "0,0", ` +
-				`ParentID: 2, ParentSchemaID: 29, State: PUBLIC, ` +
+			exp: `typedesc.Immutable: {ID: 21, Version: 3, ModificationTime: "0,0", ` +
+				`ParentID: 2, ParentSchemaID: 29, State: PUBLIC, NumDrainingNames: 1, ` +
 				`Kind: ALIAS, ArrayTypeID: 117, ReferencingDescriptorIDs: [73, 37]}`,
 		},
 		{
 			desc: typedesc.NewBuilder(&descpb.TypeDescriptor{
-				Name:                     "foo",
-				ID:                       21,
-				Version:                  3,
+				Name:    "foo",
+				ID:      21,
+				Version: 3,
+				DrainingNames: []descpb.NameInfo{
+					{
+						ParentID:       2,
+						ParentSchemaID: 29,
+						Name:           "bar",
+					},
+				},
 				Privileges:               descpb.NewDefaultPrivilegeDescriptor(security.RootUserName()),
 				ParentID:                 2,
 				ParentSchemaID:           29,
@@ -60,8 +74,8 @@ func TestSafeMessage(t *testing.T) {
 					{},
 				},
 			}).BuildImmutableType(),
-			exp: `typedesc.immutable: {ID: 21, Version: 3, ModificationTime: "0,0", ` +
-				`ParentID: 2, ParentSchemaID: 29, State: PUBLIC, ` +
+			exp: `typedesc.Immutable: {ID: 21, Version: 3, ModificationTime: "0,0", ` +
+				`ParentID: 2, ParentSchemaID: 29, State: PUBLIC, NumDrainingNames: 1, ` +
 				`Kind: ENUM, NumEnumMembers: 1, ArrayTypeID: 117, ReferencingDescriptorIDs: [73, 37]}`,
 		},
 	} {
