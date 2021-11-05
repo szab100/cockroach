@@ -84,9 +84,24 @@ func MakeBuilder(
 	}
 
 	// Set up the interstices for encoding interleaved tables later.
-	//
-	// TODO(yuzefovich): simplify this, interleaves are dead now.
 	s.interstices[0] = s.KeyPrefix
+	if index.NumInterleaveAncestors() > 0 {
+		// TODO(rohany): too much of this code is copied from EncodePartialIndexKey.
+		sharedPrefixLen := 0
+		for i := 0; i < index.NumInterleaveAncestors(); i++ {
+			ancestor := index.GetInterleaveAncestor(i)
+			// The first ancestor is already encoded in interstices[0].
+			if i != 0 {
+				s.interstices[sharedPrefixLen] = rowenc.EncodePartialTableIDIndexID(
+					s.interstices[sharedPrefixLen], ancestor.TableID, ancestor.IndexID)
+			}
+			sharedPrefixLen += int(ancestor.SharedPrefixLen)
+			s.interstices[sharedPrefixLen] = encoding.EncodeInterleavedSentinel(
+				s.interstices[sharedPrefixLen])
+		}
+		s.interstices[sharedPrefixLen] = rowenc.EncodePartialTableIDIndexID(
+			s.interstices[sharedPrefixLen], table.GetID(), index.GetID())
+	}
 
 	return s
 }
@@ -436,11 +451,8 @@ var _ InvertedSpans = inverted.SpanExpressionProtoSpans{}
 // non-inverted prefix columns of the index. Each span in c must have a single
 // key. The resulting roachpb.Spans are created by performing a cross product of
 // keys in c and the invertedSpan keys.
-//
-// scratch can be an optional roachpb.Spans slice that will be reused to
-// populate the result.
 func (s *Builder) SpansFromInvertedSpans(
-	invertedSpans InvertedSpans, c *constraint.Constraint, scratch roachpb.Spans,
+	invertedSpans InvertedSpans, c *constraint.Constraint,
 ) (roachpb.Spans, error) {
 	if invertedSpans == nil {
 		return nil, errors.AssertionFailedf("invertedSpans cannot be nil")
@@ -475,7 +487,7 @@ func (s *Builder) SpansFromInvertedSpans(
 		scratchRows[0] = make(rowenc.EncDatumRow, 1)
 	}
 
-	scratch = scratch[:0]
+	var spans roachpb.Spans
 	for i := range scratchRows {
 		for j, n := 0, invertedSpans.Len(); j < n; j++ {
 			var indexSpan roachpb.Span
@@ -486,11 +498,11 @@ func (s *Builder) SpansFromInvertedSpans(
 			if indexSpan.EndKey, err = s.generateInvertedSpanKey(invertedSpans.End(j), scratchRows[i]); err != nil {
 				return nil, err
 			}
-			scratch = append(scratch, indexSpan)
+			spans = append(spans, indexSpan)
 		}
 	}
-	sort.Sort(scratch)
-	return scratch, nil
+	sort.Sort(spans)
+	return spans, nil
 }
 
 // generateInvertedSpanKey returns a key that encodes enc and scratchRow. The

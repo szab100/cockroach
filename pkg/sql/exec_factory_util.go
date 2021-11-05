@@ -33,7 +33,6 @@ func constructPlan(
 	subqueries []exec.Subquery,
 	cascades []exec.Cascade,
 	checks []exec.Node,
-	rootRowCount int64,
 ) (exec.Plan, error) {
 	res := &planComponents{}
 	assignPlan := func(plan *planMaybePhysical, node exec.Node) {
@@ -47,7 +46,6 @@ func constructPlan(
 		}
 	}
 	assignPlan(&res.main, root)
-	res.mainRowCount = rootRowCount
 	if len(subqueries) > 0 {
 		res.subqueryPlans = make([]subquery, len(subqueries))
 		for i := range subqueries {
@@ -67,7 +65,6 @@ func constructPlan(
 				return nil, errors.Errorf("invalid SubqueryMode %d", in.Mode)
 			}
 			out.expanded = true
-			out.rowCount = in.RowCount
 			assignPlan(&out.plan, in.Root)
 		}
 	}
@@ -108,7 +105,7 @@ func makeScanColumnsConfig(table cat.Table, cols exec.TableColumnOrdinalSet) sca
 			typ := col.DatumType()
 			colOrd = col.InvertedSourceColumnOrdinal()
 			col = table.Column(colOrd)
-			colCfg.invertedColumn = &struct {
+			colCfg.virtualColumn = &struct {
 				colID tree.ColumnID
 				typ   *types.T
 			}{
@@ -123,11 +120,11 @@ func makeScanColumnsConfig(table cat.Table, cols exec.TableColumnOrdinalSet) sca
 }
 
 // getResultColumnsForSimpleProject populates result columns for a simple
-// projection. inputCols must be non-nil and contain the result columns before
-// the projection has been applied. It supports two configurations:
+// projection. It supports two configurations:
 // 1. colNames and resultTypes are non-nil. resultTypes indicates the updated
 //    types (after the projection has been applied)
-// 2. colNames is nil.
+// 2. if colNames is nil, then inputCols must be non-nil (which are the result
+//    columns before the projection has been applied).
 func getResultColumnsForSimpleProject(
 	cols []exec.NodeColumnOrdinal,
 	colNames []string,
@@ -143,10 +140,8 @@ func getResultColumnsForSimpleProject(
 			resultCols[i].Hidden = false
 		} else {
 			resultCols[i] = colinfo.ResultColumn{
-				Name:           colNames[i],
-				Typ:            resultTypes[i],
-				TableID:        inputCols[col].TableID,
-				PGAttributeNum: inputCols[col].PGAttributeNum,
+				Name: colNames[i],
+				Typ:  resultTypes[i],
 			}
 		}
 	}
