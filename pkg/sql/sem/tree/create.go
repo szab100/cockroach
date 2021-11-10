@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -213,6 +214,7 @@ type CreateIndex struct {
 	// Extra columns to be stored together with the indexed ones as an optimization
 	// for improved reading performance.
 	Storing          NameList
+	Interleave       *InterleaveDef
 	PartitionByIndex *PartitionByIndex
 	StorageParams    StorageParams
 	Predicate        Expr
@@ -259,6 +261,9 @@ func (node *CreateIndex) Format(ctx *FmtCtx) {
 		ctx.WriteString(" STORING (")
 		ctx.FormatNode(&node.Storing)
 		ctx.WriteByte(')')
+	}
+	if node.Interleave != nil {
+		ctx.FormatNode(node.Interleave)
 	}
 	if node.PartitionByIndex != nil {
 		ctx.FormatNode(node.PartitionByIndex)
@@ -933,6 +938,7 @@ type IndexTableDef struct {
 	Columns          IndexElemList
 	Sharded          *ShardedIndexDef
 	Storing          NameList
+	Interleave       *InterleaveDef
 	Inverted         bool
 	PartitionByIndex *PartitionByIndex
 	StorageParams    StorageParams
@@ -959,6 +965,9 @@ func (node *IndexTableDef) Format(ctx *FmtCtx) {
 		ctx.WriteString(" STORING (")
 		ctx.FormatNode(&node.Storing)
 		ctx.WriteByte(')')
+	}
+	if node.Interleave != nil {
+		ctx.FormatNode(node.Interleave)
 	}
 	if node.PartitionByIndex != nil {
 		ctx.FormatNode(node.PartitionByIndex)
@@ -1028,6 +1037,9 @@ func (node *UniqueConstraintTableDef) Format(ctx *FmtCtx) {
 		ctx.WriteString(" STORING (")
 		ctx.FormatNode(&node.Storing)
 		ctx.WriteByte(')')
+	}
+	if node.Interleave != nil {
+		ctx.FormatNode(node.Interleave)
 	}
 	if node.PartitionByIndex != nil {
 		ctx.FormatNode(node.PartitionByIndex)
@@ -1201,6 +1213,32 @@ type ShardedIndexDef struct {
 func (node *ShardedIndexDef) Format(ctx *FmtCtx) {
 	ctx.WriteString(" USING HASH WITH BUCKET_COUNT = ")
 	ctx.FormatNode(node.ShardBuckets)
+}
+
+// InterleaveDef represents an interleave definition within a CREATE TABLE
+// or CREATE INDEX statement.
+type InterleaveDef struct {
+	Parent       TableName
+	Fields       NameList
+	DropBehavior DropBehavior
+}
+
+// Format implements the NodeFormatter interface.
+func (node *InterleaveDef) Format(ctx *FmtCtx) {
+	ctx.WriteString(" INTERLEAVE IN PARENT ")
+	ctx.FormatNode(&node.Parent)
+	ctx.WriteString(" (")
+	for i := range node.Fields {
+		if i > 0 {
+			ctx.WriteString(", ")
+		}
+		ctx.FormatNode(&node.Fields[i])
+	}
+	ctx.WriteString(")")
+	if node.DropBehavior != DropDefault {
+		ctx.WriteString(" ")
+		ctx.WriteString(node.DropBehavior.String())
+	}
 }
 
 // PartitionByType is an enum of each type of partitioning (LIST/RANGE).
@@ -1392,6 +1430,7 @@ const (
 type CreateTable struct {
 	IfNotExists      bool
 	Table            TableName
+	Interleave       *InterleaveDef
 	PartitionByTable *PartitionByTable
 	Persistence      Persistence
 	StorageParams    StorageParams
@@ -1457,6 +1496,9 @@ func (node *CreateTable) FormatBody(ctx *FmtCtx) {
 		ctx.WriteString(" (")
 		ctx.FormatNode(&node.Defs)
 		ctx.WriteByte(')')
+		if node.Interleave != nil {
+			ctx.FormatNode(node.Interleave)
+		}
 		if node.PartitionByTable != nil {
 			ctx.FormatNode(node.PartitionByTable)
 		}
@@ -1531,8 +1573,10 @@ func (node *CreateTable) HoistConstraints() {
 // CreateSchema represents a CREATE SCHEMA statement.
 type CreateSchema struct {
 	IfNotExists bool
-	AuthRole    RoleSpec
-	Schema      ObjectNamePrefix
+	// TODO(solon): Adjust this, see
+	// https://github.com/cockroachdb/cockroach/issues/54696
+	AuthRole security.SQLUsername
+	Schema   ObjectNamePrefix
 }
 
 // Format implements the NodeFormatter interface.
@@ -1550,7 +1594,7 @@ func (node *CreateSchema) Format(ctx *FmtCtx) {
 
 	if !node.AuthRole.Undefined() {
 		ctx.WriteString(" AUTHORIZATION ")
-		ctx.FormatNode(&node.AuthRole)
+		ctx.FormatUsername(node.AuthRole)
 	}
 }
 
@@ -1768,9 +1812,7 @@ func (o KVOptions) ToRoleOptions(
 	roleOptions := make(roleoption.List, len(o))
 
 	for i, ro := range o {
-		// Role options are always stored as keywords in ro.Key by the
-		// parser.
-		option, err := roleoption.ToOption(string(ro.Key))
+		option, err := roleoption.ToOption(ro.Key.String())
 		if err != nil {
 			return nil, err
 		}
@@ -1803,21 +1845,23 @@ func (o KVOptions) ToRoleOptions(
 
 func (o *KVOptions) formatAsRoleOptions(ctx *FmtCtx) {
 	for _, option := range *o {
-		ctx.WriteByte(' ')
-		// Role option keys are always sequences of keywords separated
-		// by spaces.
-		ctx.WriteString(strings.ToUpper(string(option.Key)))
+		ctx.WriteString(" ")
+		ctx.WriteString(
+			// "_" replaces space (" ") in YACC for handling tree.Name formatting.
+			strings.ReplaceAll(
+				strings.ToUpper(option.Key.String()), "_", " "),
+		)
 
 		// Password is a special case.
-		if strings.HasSuffix(string(option.Key), "password") {
-			ctx.WriteByte(' ')
+		if strings.ToUpper(option.Key.String()) == "PASSWORD" {
+			ctx.WriteString(" ")
 			if ctx.flags.HasFlags(FmtShowPasswords) {
 				ctx.FormatNode(option.Value)
 			} else {
 				ctx.WriteString(PasswordSubstitution)
 			}
 		} else if option.Value != nil {
-			ctx.WriteByte(' ')
+			ctx.WriteString(" ")
 			if ctx.HasFlags(FmtHideConstants) {
 				ctx.WriteString("'_'")
 			} else {
@@ -1829,7 +1873,7 @@ func (o *KVOptions) formatAsRoleOptions(ctx *FmtCtx) {
 
 // CreateRole represents a CREATE ROLE statement.
 type CreateRole struct {
-	Name        RoleSpec
+	Name        Expr
 	IfNotExists bool
 	IsRole      bool
 	KVOptions   KVOptions
@@ -1846,7 +1890,7 @@ func (node *CreateRole) Format(ctx *FmtCtx) {
 	if node.IfNotExists {
 		ctx.WriteString("IF NOT EXISTS ")
 	}
-	ctx.FormatNode(&node.Name)
+	ctx.FormatNode(node.Name)
 
 	if len(node.KVOptions) > 0 {
 		ctx.WriteString(" WITH")
