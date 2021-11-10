@@ -730,9 +730,8 @@ func parseClientProvidedSessionParameters(
 	trustClientProvidedRemoteAddr bool,
 ) (sql.SessionArgs, error) {
 	args := sql.SessionArgs{
-		SessionDefaults:             make(map[string]string),
-		CustomOptionSessionDefaults: make(map[string]string),
-		RemoteAddr:                  origRemoteAddr,
+		SessionDefaults: make(map[string]string),
+		RemoteAddr:      origRemoteAddr,
 	}
 	foundBufferSize := false
 
@@ -740,10 +739,8 @@ func parseClientProvidedSessionParameters(
 		// Read a key-value pair from the client.
 		key, err := buf.GetString()
 		if err != nil {
-			return sql.SessionArgs{}, pgerror.Wrap(
-				err, pgcode.ProtocolViolation,
-				"error reading option key",
-			)
+			return sql.SessionArgs{}, pgerror.Newf(pgcode.ProtocolViolation,
+				"error reading option key: %s", err)
 		}
 		if len(key) == 0 {
 			// End of parameter list.
@@ -751,10 +748,8 @@ func parseClientProvidedSessionParameters(
 		}
 		value, err := buf.GetString()
 		if err != nil {
-			return sql.SessionArgs{}, pgerror.Wrapf(
-				err, pgcode.ProtocolViolation,
-				"error reading option value for key %q", key,
-			)
+			return sql.SessionArgs{}, pgerror.Newf(pgcode.ProtocolViolation,
+				"error reading option value: %s", err)
 		}
 
 		// Case-fold for the key for easier comparison.
@@ -793,17 +788,13 @@ func parseClientProvidedSessionParameters(
 
 			hostS, portS, err := net.SplitHostPort(value)
 			if err != nil {
-				return sql.SessionArgs{}, pgerror.Wrap(
-					err, pgcode.ProtocolViolation,
-					"invalid address format",
-				)
+				return sql.SessionArgs{}, pgerror.Newf(pgcode.ProtocolViolation,
+					"invalid address format: %v", err)
 			}
 			port, err := strconv.Atoi(portS)
 			if err != nil {
-				return sql.SessionArgs{}, pgerror.Wrap(
-					err, pgcode.ProtocolViolation,
-					"remote port is not numeric",
-				)
+				return sql.SessionArgs{}, pgerror.Newf(pgcode.ProtocolViolation,
+					"remote port is not numeric: %v", err)
 			}
 			ip := net.ParseIP(hostS)
 			if ip == nil {
@@ -857,14 +848,12 @@ func parseClientProvidedSessionParameters(
 }
 
 func loadParameter(ctx context.Context, key, value string, args *sql.SessionArgs) error {
-	key = strings.ToLower(key)
 	exists, configurable := sql.IsSessionVariableConfigurable(key)
 
 	switch {
 	case exists && configurable:
 		args.SessionDefaults[key] = value
-	case sql.IsCustomOptionSessionVariable(key):
-		args.CustomOptionSessionDefaults[key] = value
+
 	case !exists:
 		if _, ok := sql.UnsupportedVars[key]; ok {
 			counter := sqltelemetry.UnimplementedClientStatusParameterCounter(key)
