@@ -225,9 +225,10 @@ func (n *alterTableNode) startExec(params runParams) error {
 
 					// Translate this operation into an ALTER PRIMARY KEY command.
 					alterPK := &tree.AlterTableAlterPrimaryKey{
-						Columns: d.Columns,
-						Sharded: d.Sharded,
-						Name:    d.Name,
+						Columns:    d.Columns,
+						Sharded:    d.Sharded,
+						Interleave: d.Interleave,
+						Name:       d.Name,
 					}
 					if err := params.p.AlterPrimaryKey(
 						params.ctx,
@@ -1536,10 +1537,14 @@ func injectTableStats(
 	}
 
 	// Invalidate the local cache synchronously; this guarantees that the next
-	// statement in the same session won't use a stale cache (the cache would
-	// normally be updated asynchronously).
+	// statement in the same session won't use a stale cache (whereas the gossip
+	// update is handled asynchronously).
 	params.extendedEvalCtx.ExecCfg.TableStatsCache.InvalidateTableStats(params.ctx, desc.GetID())
 
+	// Use Gossip to refresh the caches on other nodes.
+	if g, ok := params.extendedEvalCtx.ExecCfg.Gossip.Optional(47925); ok {
+		return stats.GossipTableStatAdded(g, desc.GetID())
+	}
 	return nil
 }
 

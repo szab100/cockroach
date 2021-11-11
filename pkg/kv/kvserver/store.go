@@ -53,11 +53,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
-	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigstore"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -215,11 +213,11 @@ func testStoreConfig(clock *hlc.Clock, version roachpb.Version) StoreConfig {
 		clock = hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	}
 	st := cluster.MakeTestingClusterSettingsWithVersions(version, version, true)
-	tracer := tracing.NewTracerWithOpt(context.TODO(), tracing.WithClusterSettings(&st.SV))
 	sc := StoreConfig{
 		DefaultSpanConfig:           zonepb.DefaultZoneConfigRef().AsSpanConfig(),
+		DefaultSystemSpanConfig:     zonepb.DefaultSystemZoneConfigRef().AsSpanConfig(),
 		Settings:                    st,
-		AmbientCtx:                  log.AmbientContext{Tracer: tracer},
+		AmbientCtx:                  log.AmbientContext{Tracer: st.Tracer},
 		Clock:                       clock,
 		CoalescedHeartbeatsInterval: 50 * time.Millisecond,
 		ScanInterval:                10 * time.Minute,
@@ -364,8 +362,9 @@ func (rs *storeReplicaVisitor) Visit(visitor func(*Replica) bool) {
 	// stale) view of all Replicas without holding the Store lock. In particular,
 	// no locks are acquired during the copy process.
 	rs.repls = nil
-	rs.store.mu.replicasByRangeID.Range(func(repl *Replica) {
-		rs.repls = append(rs.repls, repl)
+	rs.store.mu.replicas.Range(func(k int64, v unsafe.Pointer) bool {
+		rs.repls = append(rs.repls, (*Replica)(v))
+		return true
 	})
 
 	if rs.ordered {
@@ -585,7 +584,7 @@ type Store struct {
 		syncutil.RWMutex
 		// Map of replicas by Range ID (map[roachpb.RangeID]*Replica). This
 		// includes `uninitReplicas`. May be read without holding Store.mu.
-		replicasByRangeID rangeIDReplicaMap
+		replicas syncutil.IntMap
 		// A btree key containing objects of type *Replica or *ReplicaPlaceholder.
 		// Both types have an associated key range; the btree is keyed on their
 		// start keys.
@@ -650,7 +649,6 @@ type Store struct {
 
 	computeInitialMetrics              sync.Once
 	systemConfigUpdateQueueRateLimiter *quotapool.RateLimiter
-	spanConfigUpdateQueueRateLimiter   *quotapool.RateLimiter
 }
 
 var _ kv.Sender = &Store{}
@@ -663,17 +661,18 @@ type StoreConfig struct {
 	AmbientCtx log.AmbientContext
 	base.RaftConfig
 
-	DefaultSpanConfig    roachpb.SpanConfig
-	Settings             *cluster.Settings
-	Clock                *hlc.Clock
-	DB                   *kv.DB
-	Gossip               *gossip.Gossip
-	NodeLiveness         *liveness.NodeLiveness
-	StorePool            *StorePool
-	Transport            *RaftTransport
-	NodeDialer           *nodedialer.Dialer
-	RPCContext           *rpc.Context
-	RangeDescriptorCache *rangecache.RangeCache
+	DefaultSpanConfig       roachpb.SpanConfig
+	DefaultSystemSpanConfig roachpb.SpanConfig
+	Settings                *cluster.Settings
+	Clock                   *hlc.Clock
+	DB                      *kv.DB
+	Gossip                  *gossip.Gossip
+	NodeLiveness            *liveness.NodeLiveness
+	StorePool               *StorePool
+	Transport               *RaftTransport
+	NodeDialer              *nodedialer.Dialer
+	RPCContext              *rpc.Context
+	RangeDescriptorCache    *rangecache.RangeCache
 
 	ClosedTimestampSender   *sidetransport.Sender
 	ClosedTimestampReceiver sidetransportReceiver
@@ -758,13 +757,6 @@ type StoreConfig struct {
 	// SpanConfigsEnabled determines whether we're able to use the span configs
 	// infrastructure.
 	SpanConfigsEnabled bool
-	// Used to subscribe to span configuration changes, keeping up-to-date a
-	// data structure useful for retrieving span configs. Only available if
-	// SpanConfigsEnabled.
-	SpanConfigSubscriber spanconfig.KVSubscriber
-
-	// KVAdmissionController is an optional field used for admission control.
-	KVAdmissionController KVAdmissionController
 }
 
 // ConsistencyTestingKnobs is a BatchEvalTestingKnobs struct used to control the
@@ -847,18 +839,11 @@ func NewStore(
 		ctSender: cfg.ClosedTimestampSender,
 	}
 	if cfg.RPCContext != nil {
-		s.allocator = MakeAllocator(
-			cfg.StorePool,
-			cfg.RPCContext.RemoteClocks.Latency,
-			cfg.TestingKnobs.AllocatorKnobs,
-		)
+		s.allocator = MakeAllocator(cfg.StorePool, cfg.RPCContext.RemoteClocks.Latency)
 	} else {
-		s.allocator = MakeAllocator(
-			cfg.StorePool, func(string) (time.Duration, bool) {
-				return 0, false
-			},
-			cfg.TestingKnobs.AllocatorKnobs,
-		)
+		s.allocator = MakeAllocator(cfg.StorePool, func(string) (time.Duration, bool) {
+			return 0, false
+		})
 	}
 	s.replRankings = newReplicaRankings()
 
@@ -1365,10 +1350,10 @@ func IterateIDPrefixKeys(
 	}
 }
 
-// IterateRangeDescriptorsFromDisk calls the provided function with each
-// descriptor from the provided Engine. The return values of this method and fn
-// have semantics similar to engine.MVCCIterate.
-func IterateRangeDescriptorsFromDisk(
+// IterateRangeDescriptors calls the provided function with each descriptor
+// from the provided Engine. The return values of this method and fn have
+// semantics similar to engine.MVCCIterate.
+func IterateRangeDescriptors(
 	ctx context.Context, reader storage.Reader, fn func(desc roachpb.RangeDescriptor) error,
 ) error {
 	log.Event(ctx, "beginning range descriptor iteration")
@@ -1520,7 +1505,7 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	// concurrently. Note that while we can perform this initialization
 	// concurrently, all of the initialization must be performed before we start
 	// listening for Raft messages and starting the process Raft loop.
-	err = IterateRangeDescriptorsFromDisk(ctx, s.engine,
+	err = IterateRangeDescriptors(ctx, s.engine,
 		func(desc roachpb.RangeDescriptor) error {
 			if !desc.IsInitialized() {
 				return errors.Errorf("found uninitialized RangeDescriptor: %+v", desc)
@@ -1638,26 +1623,6 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 		})
 	}
 
-	if s.cfg.SpanConfigsEnabled {
-		s.cfg.SpanConfigSubscriber.Subscribe(func(update roachpb.Span) {
-			s.onSpanConfigUpdate(ctx, update)
-		})
-
-		// When toggling between the system config span and the span configs
-		// infrastructure, we want to re-apply configs on all replicas from
-		// whatever the new source is.
-		spanconfigstore.EnabledSetting.SetOnChange(&s.ClusterSettings().SV, func(ctx context.Context) {
-			enabled := spanconfigstore.EnabledSetting.Get(&s.ClusterSettings().SV)
-			if enabled {
-				s.applyAllFromSpanConfigStore(ctx)
-			} else {
-				if s.cfg.Gossip != nil && s.cfg.Gossip.GetSystemConfig() != nil {
-					s.systemGossipUpdate(s.cfg.Gossip.GetSystemConfig())
-				}
-			}
-		})
-	}
-
 	if !s.cfg.TestingKnobs.DisableAutomaticLeaseRenewal {
 		s.startLeaseRenewer(ctx)
 	}
@@ -1681,6 +1646,22 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 		rate := consistencyCheckRate.Get(&s.ClusterSettings().SV)
 		s.consistencyLimiter.UpdateLimit(quotapool.Limit(rate), rate*consistencyCheckRateBurstFactor)
 	})
+
+	// Storing suggested compactions in the store itself was deprecated with
+	// the removal of the Compactor in 21.1. See discussion in
+	// https://github.com/cockroachdb/cockroach/pull/55893
+	//
+	// TODO(bilal): Remove this code in versions after 21.1.
+	err = s.engine.MVCCIterate(
+		keys.StoreSuggestedCompactionKeyPrefix(),
+		keys.StoreSuggestedCompactionKeyPrefix().PrefixEnd(),
+		storage.MVCCKeyIterKind,
+		func(res storage.MVCCKeyValue) error {
+			return s.engine.ClearUnversioned(res.Key.Key)
+		})
+	if err != nil {
+		log.Warningf(ctx, "error when clearing compactor keys: %s", err)
+	}
 
 	// Set the started flag (for unittests).
 	atomic.StoreInt32(&s.started, 1)
@@ -1797,10 +1778,6 @@ func (s *Store) GetConfReader() (spanconfig.StoreReader, error) {
 	sysCfg := s.cfg.Gossip.GetSystemConfig()
 	if sysCfg == nil {
 		return nil, errSysCfgUnavailable
-	}
-
-	if s.cfg.SpanConfigsEnabled && spanconfigstore.EnabledSetting.Get(&s.ClusterSettings().SV) {
-		return spanconfigstore.NewShadowReader(s.cfg.SpanConfigSubscriber, sysCfg), nil
 	}
 
 	return sysCfg, nil
@@ -1957,11 +1934,11 @@ func (s *Store) systemGossipUpdate(sysCfg *config.SystemConfig) {
 
 	// We'll want to offer all replicas to the split and merge queues. Be a little
 	// careful about not spawning too many individual goroutines.
-	shouldQueue := s.systemConfigUpdateQueueRateLimiter.AdmitN(1)
 
 	// For every range, update its zone config and check if it needs to
 	// be split or merged.
 	now := s.cfg.Clock.NowAsClockTimestamp()
+	shouldQueue := s.systemConfigUpdateQueueRateLimiter.AdmitN(1)
 	newStoreReplicaVisitor(s).Visit(func(repl *Replica) bool {
 		key := repl.Desc().StartKey
 		conf, err := sysCfg.GetSpanConfigForKey(ctx, key)
@@ -1980,110 +1957,6 @@ func (s *Store) systemGossipUpdate(sysCfg *config.SystemConfig) {
 				h.MaybeAdd(ctx, repl, now)
 			})
 		}
-		return true // more
-	})
-}
-
-// onSpanConfigUpdate is the callback invoked whenever this store learns of a
-// span config update.
-func (s *Store) onSpanConfigUpdate(ctx context.Context, updated roachpb.Span) {
-	if !spanconfigstore.EnabledSetting.Get(&s.ClusterSettings().SV) {
-		return
-	}
-
-	sp, err := keys.SpanAddr(updated)
-	if err != nil {
-		log.Errorf(ctx, "skipped applying update (%s), unexpected error resolving span address: %v",
-			updated, err)
-		return
-	}
-
-	now := s.cfg.Clock.NowAsClockTimestamp()
-	if err := s.mu.replicasByKey.VisitKeyRange(ctx, sp.Key, sp.EndKey, AscendingKeyOrder,
-		func(ctx context.Context, it replicaOrPlaceholder) error {
-			repl := it.repl
-			if repl == nil {
-				return nil // placeholder; ignore
-			}
-
-			startKey := repl.Desc().StartKey
-			if !sp.ContainsKey(startKey) {
-				// It's possible that the update we're receiving here is the
-				// right-hand side of a span config getting split. Think of
-				// installing a zone config on some partition of an index where
-				// previously there was none on any of the partitions. The range
-				// spanning the entire index would have to split on the
-				// partition boundary, and before it does so, it's possible that
-				// it would receive a span config update for just the partition.
-				//
-				// To avoid clobbering the pre-split range's embedded span
-				// config with the partition's config, we'll ensure that the
-				// range's start key is part of the update. We don't have to
-				// enqueue the range in the split queue here, that takes place
-				// when processing the left-hand side span config update.
-
-				return nil // ignore
-			}
-
-			// TODO(irfansharif): It's possible for a config to be applied over an
-			// entire range when it only pertains to the first half of the range.
-			// This will be corrected shortly -- we enqueue the range for a split
-			// below where we then apply the right config on each half. But still,
-			// it's surprising behavior and gets in the way of a desirable
-			// consistency guarantee: a key's config at any point in time is one
-			// that was explicitly declared over it, or the default config.
-			//
-			// We can do better, we can skip applying the config entirely and
-			// enqueue the split, then relying on the split trigger to install
-			// the right configs on each half. The current structure is as it is
-			// to maintain parity with the system config span variant.
-
-			replCtx := repl.AnnotateCtx(ctx)
-			conf, err := s.cfg.SpanConfigSubscriber.GetSpanConfigForKey(replCtx, startKey)
-			if err != nil {
-				log.Errorf(ctx, "skipped applying update, unexpected error reading from subscriber: %v", err)
-				return err
-			}
-			repl.SetSpanConfig(conf)
-
-			// TODO(irfansharif): For symmetry with the system config span variant,
-			// we queue blindly; we could instead only queue it if we knew the
-			// range's keyspans has a split in there somewhere, or was now part of a
-			// larger range and eligible for a merge.
-			s.splitQueue.Async(replCtx, "span config update", true /* wait */, func(ctx context.Context, h queueHelper) {
-				h.MaybeAdd(ctx, repl, now)
-			})
-			s.mergeQueue.Async(replCtx, "span config update", true /* wait */, func(ctx context.Context, h queueHelper) {
-				h.MaybeAdd(ctx, repl, now)
-			})
-			return nil // more
-		},
-	); err != nil {
-		// Errors here should not be possible, but if there is one, log loudly.
-		log.Errorf(ctx, "unexpected error visiting replicas: %v", err)
-	}
-}
-
-// applyAllFromSpanConfigStore applies, on each replica, span configs from the
-// embedded span config store.
-func (s *Store) applyAllFromSpanConfigStore(ctx context.Context) {
-	now := s.cfg.Clock.NowAsClockTimestamp()
-	newStoreReplicaVisitor(s).Visit(func(repl *Replica) bool {
-		replCtx := repl.AnnotateCtx(ctx)
-		key := repl.Desc().StartKey
-		conf, err := s.cfg.SpanConfigSubscriber.GetSpanConfigForKey(replCtx, key)
-		if err != nil {
-			log.Errorf(ctx, "skipped applying config update, unexpected error reading from subscriber: %v", err)
-			return true // more
-		}
-
-		repl.SetSpanConfig(conf)
-		s.splitQueue.Async(replCtx, "span config update", true /* wait */, func(ctx context.Context, h queueHelper) {
-			h.MaybeAdd(ctx, repl, now)
-		})
-		s.mergeQueue.Async(replCtx, "span config update", true /* wait */, func(ctx context.Context, h queueHelper) {
-			h.MaybeAdd(ctx, repl, now)
-		})
 		return true // more
 	})
 }
@@ -2203,24 +2076,10 @@ func (s *Store) recordNewPerSecondStats(newQPS, newWPS float64) {
 	s.asyncGossipStore(context.TODO(), message, false /* useCached */)
 }
 
-// VisitReplicasOption optionally modifies store.VisitReplicas.
-type VisitReplicasOption func(*storeReplicaVisitor)
-
-// WithReplicasInOrder is a VisitReplicasOption that ensures replicas are
-// visited in increasing RangeID order.
-func WithReplicasInOrder() VisitReplicasOption {
-	return func(visitor *storeReplicaVisitor) {
-		visitor.InOrder()
-	}
-}
-
 // VisitReplicas invokes the visitor on the Store's Replicas until the visitor returns false.
 // Replicas which are added to the Store after iteration begins may or may not be observed.
-func (s *Store) VisitReplicas(visitor func(*Replica) (wantMore bool), opts ...VisitReplicasOption) {
+func (s *Store) VisitReplicas(visitor func(*Replica) (wantMore bool)) {
 	v := newStoreReplicaVisitor(s)
-	for _, opt := range opts {
-		opt(v)
-	}
 	v.Visit(visitor)
 }
 
@@ -2410,8 +2269,8 @@ func (s *Store) GetReplica(rangeID roachpb.RangeID) (*Replica, error) {
 
 // GetReplicaIfExists returns the replica with the given RangeID or nil.
 func (s *Store) GetReplicaIfExists(rangeID roachpb.RangeID) *Replica {
-	if repl, ok := s.mu.replicasByRangeID.Load(rangeID); ok {
-		return repl
+	if value, ok := s.mu.replicas.Load(int64(rangeID)); ok {
+		return (*Replica)(value)
 	}
 	return nil
 }
@@ -2458,8 +2317,8 @@ func (s *Store) getOverlappingKeyRangeLocked(
 // RaftStatus returns the current raft status of the local replica of
 // the given range.
 func (s *Store) RaftStatus(rangeID roachpb.RangeID) *raft.Status {
-	if repl, ok := s.mu.replicasByRangeID.Load(rangeID); ok {
-		return repl.RaftStatus()
+	if value, ok := s.mu.replicas.Load(int64(rangeID)); ok {
+		return (*Replica)(value).RaftStatus()
 	}
 	return nil
 }
@@ -2589,8 +2448,9 @@ func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapa
 // performance critical code.
 func (s *Store) ReplicaCount() int {
 	var count int
-	s.mu.replicasByRangeID.Range(func(*Replica) {
+	s.mu.replicas.Range(func(_ int64, _ unsafe.Pointer) bool {
 		count++
+		return true
 	})
 	return count
 }
@@ -2661,6 +2521,12 @@ func (s *Store) RangeFeed(
 // scanning ranges. An ideal solution would be to create incremental events
 // whenever availability changes.
 func (s *Store) updateReplicationGauges(ctx context.Context) error {
+	// Load the system config.
+	cfg := s.Gossip().GetSystemConfig()
+	if cfg == nil {
+		return errors.Errorf("%s: system config not yet available", s)
+	}
+
 	var (
 		raftLeaderCount               int64
 		leaseHolderCount              int64
@@ -2891,7 +2757,7 @@ func (s *Store) ComputeStatsForKeySpan(startKey, endKey roachpb.RKey) (StoreKeyS
 // carrying out any changes, returning all trace messages collected along the way.
 // Intended to help power a debug endpoint.
 func (s *Store) AllocatorDryRun(ctx context.Context, repl *Replica) (tracing.Recording, error) {
-	ctx, collect, cancel := tracing.ContextWithRecordingSpan(ctx, s.cfg.AmbientCtx.Tracer, "allocator dry run")
+	ctx, collect, cancel := tracing.ContextWithRecordingSpan(ctx, s.ClusterSettings().Tracer, "allocator dry run")
 	defer cancel()
 	canTransferLease := func(ctx context.Context, repl *Replica) bool { return true }
 	_, err := s.replicateQueue.processOneChange(
@@ -2943,7 +2809,7 @@ func (s *Store) ManuallyEnqueue(
 	}
 
 	ctx, collect, cancel := tracing.ContextWithRecordingSpan(
-		ctx, s.cfg.AmbientCtx.Tracer, fmt.Sprintf("manual %s queue run", queueName))
+		ctx, s.ClusterSettings().Tracer, fmt.Sprintf("manual %s queue run", queueName))
 	defer cancel()
 
 	if !skipShouldQueue {
@@ -3100,123 +2966,7 @@ func min(a, b int) int {
 	return b
 }
 
-// KVAdmissionController provides admission control for the KV layer.
-type KVAdmissionController interface {
-	// AdmitKVWork must be called before performing KV work.
-	// BatchRequest.AdmissionHeader and BatchRequest.Replica.StoreID must be
-	// populated for admission to work correctly. If err is non-nil, the
-	// returned handle can be ignored. If err is nil, AdmittedKVWorkDone must be
-	// called after the KV work is done executing.
-	AdmitKVWork(
-		ctx context.Context, tenantID roachpb.TenantID, ba *roachpb.BatchRequest,
-	) (handle interface{}, err error)
-	// AdmittedKVWorkDone is called after the admitted KV work is done
-	// executing.
-	AdmittedKVWorkDone(handle interface{})
-}
-
-// KVAdmissionControllerImpl implements KVAdmissionController interface.
-type KVAdmissionControllerImpl struct {
-	// Admission control queues and coordinators. Both should be nil or non-nil.
-	kvAdmissionQ     *admission.WorkQueue
-	storeGrantCoords *admission.StoreGrantCoordinators
-}
-
-var _ KVAdmissionController = KVAdmissionControllerImpl{}
-
-type admissionHandle struct {
-	tenantID                           roachpb.TenantID
-	callAdmittedWorkDoneOnKVAdmissionQ bool
-	storeAdmissionQ                    *admission.WorkQueue
-}
-
-func isSingleHeartbeatTxnRequest(b *roachpb.BatchRequest) bool {
-	if len(b.Requests) != 1 {
-		return false
-	}
-	_, ok := b.Requests[0].GetInner().(*roachpb.HeartbeatTxnRequest)
-	return ok
-}
-
-// MakeKVAdmissionController returns a KVAdmissionController. Both parameters
-// must together either be nil or non-nil.
-func MakeKVAdmissionController(
-	kvAdmissionQ *admission.WorkQueue, storeGrantCoords *admission.StoreGrantCoordinators,
-) KVAdmissionController {
-	return KVAdmissionControllerImpl{
-		kvAdmissionQ:     kvAdmissionQ,
-		storeGrantCoords: storeGrantCoords,
-	}
-}
-
-// AdmitKVWork implements the KVAdmissionController interface.
-func (n KVAdmissionControllerImpl) AdmitKVWork(
-	ctx context.Context, tenantID roachpb.TenantID, ba *roachpb.BatchRequest,
-) (handle interface{}, err error) {
-	ah := admissionHandle{tenantID: tenantID}
-	if n.kvAdmissionQ != nil {
-		bypassAdmission := ba.IsAdmin()
-		source := ba.AdmissionHeader.Source
-		if !roachpb.IsSystemTenantID(tenantID.ToUint64()) {
-			// Request is from a SQL node.
-			bypassAdmission = false
-			source = roachpb.AdmissionHeader_FROM_SQL
-		}
-		if source == roachpb.AdmissionHeader_OTHER {
-			bypassAdmission = true
-		}
-		createTime := ba.AdmissionHeader.CreateTime
-		if !bypassAdmission && createTime == 0 {
-			// TODO(sumeer): revisit this for multi-tenant. Specifically, the SQL use
-			// of zero CreateTime needs to be revisited. It should use high priority.
-			createTime = timeutil.Now().UnixNano()
-		}
-		admissionInfo := admission.WorkInfo{
-			TenantID:        tenantID,
-			Priority:        admission.WorkPriority(ba.AdmissionHeader.Priority),
-			CreateTime:      createTime,
-			BypassAdmission: bypassAdmission,
-		}
-		var err error
-		// Don't subject HeartbeatTxnRequest to the storeAdmissionQ. Even though
-		// it would bypass admission, it would consume a slot. When writes are
-		// throttled, we start generating more txn heartbeats, which then consume
-		// all the slots, causing no useful work to happen. We do want useful work
-		// to continue even when throttling since there are often significant
-		// number of tokens available.
-		if ba.IsWrite() && !isSingleHeartbeatTxnRequest(ba) {
-			ah.storeAdmissionQ = n.storeGrantCoords.TryGetQueueForStore(int32(ba.Replica.StoreID))
-		}
-		admissionEnabled := true
-		if ah.storeAdmissionQ != nil {
-			if admissionEnabled, err = ah.storeAdmissionQ.Admit(ctx, admissionInfo); err != nil {
-				return admissionHandle{}, err
-			}
-			if !admissionEnabled {
-				// Set storeAdmissionQ to nil so that we don't call AdmittedWorkDone
-				// on it. Additionally, the code below will not call
-				// kvAdmissionQ.Admit, and so callAdmittedWorkDoneOnKVAdmissionQ will
-				// stay false.
-				ah.storeAdmissionQ = nil
-			}
-		}
-		if admissionEnabled {
-			ah.callAdmittedWorkDoneOnKVAdmissionQ, err = n.kvAdmissionQ.Admit(ctx, admissionInfo)
-			if err != nil {
-				return admissionHandle{}, err
-			}
-		}
-	}
-	return ah, nil
-}
-
-// AdmittedKVWorkDone implement the KVAdmissionController interface.
-func (n KVAdmissionControllerImpl) AdmittedKVWorkDone(handle interface{}) {
-	ah := handle.(admissionHandle)
-	if ah.callAdmittedWorkDoneOnKVAdmissionQ {
-		n.kvAdmissionQ.AdmittedWorkDone(ah.tenantID)
-	}
-	if ah.storeAdmissionQ != nil {
-		ah.storeAdmissionQ.AdmittedWorkDone(ah.tenantID)
-	}
+// TestingDefaultSpanConfig exposes the default span config for testing purposes.
+func TestingDefaultSpanConfig() roachpb.SpanConfig {
+	return zonepb.DefaultZoneConfigRef().AsSpanConfig()
 }

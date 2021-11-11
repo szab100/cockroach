@@ -757,7 +757,7 @@ func mergeCheckingTimestampCaches(
 
 		// Install a filter to capture the Raft snapshot.
 		snapshotFilter = func(inSnap kvserver.IncomingSnapshot) {
-			if inSnap.Desc.RangeID == lhsDesc.RangeID {
+			if inSnap.State.Desc.RangeID == lhsDesc.RangeID {
 				snapChan <- inSnap
 			}
 		}
@@ -809,7 +809,7 @@ func mergeCheckingTimestampCaches(
 		case <-time.After(45 * time.Second):
 			t.Fatal("timed out waiting for snapChan")
 		}
-		inSnapDesc := inSnap.Desc
+		inSnapDesc := inSnap.State.Desc
 		require.Equal(t, lhsDesc.StartKey, inSnapDesc.StartKey)
 		require.Equal(t, rhsDesc.EndKey, inSnapDesc.EndKey)
 
@@ -3731,7 +3731,7 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 		// on in the test. This function verifies that the subsumed replicas have
 		// been handled properly.
 		if snapType != kvserver.SnapshotRequest_VIA_SNAPSHOT_QUEUE ||
-			inSnap.Desc.RangeID != rangeIds[string(keyA)] {
+			inSnap.State.Desc.RangeID != rangeIds[string(keyA)] {
 			return nil
 		}
 
@@ -3779,8 +3779,8 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 
 		// Construct SSTs for the the first 4 bullets as numbered above, but only
 		// ultimately keep the last one.
-		keyRanges := rditer.MakeReplicatedKeyRanges(inSnap.Desc)
-		it := rditer.NewReplicaEngineDataIterator(inSnap.Desc, sendingEng, true /* replicatedOnly */)
+		keyRanges := rditer.MakeReplicatedKeyRanges(inSnap.State.Desc)
+		it := rditer.NewReplicaEngineDataIterator(inSnap.State.Desc, sendingEng, true /* replicatedOnly */)
 		defer it.Close()
 		// Write a range deletion tombstone to each of the SSTs then put in the
 		// kv entries from the sender of the snapshot.
@@ -4122,7 +4122,10 @@ func TestStoreRangeMergeDuringShutdown(t *testing.T) {
 
 	// Send a dummy get request on the RHS to force a lease acquisition. We expect
 	// this to fail, as quiescing stores cannot acquire leases.
-	_, err = store.DB().Get(ctx, key.Next())
+	err = s.Stopper().RunTaskWithErr(ctx, "test-get-rhs-key", func(ctx context.Context) error {
+		_, err := store.DB().Get(ctx, key.Next())
+		return err
+	})
 	if exp := "not lease holder"; !testutils.IsError(err, exp) {
 		t.Fatalf("expected %q error, but got %v", exp, err)
 	}
@@ -4204,7 +4207,7 @@ func TestMergeQueue(t *testing.T) {
 			t.Fatal(pErr)
 		}
 	}
-	rng, _ := randutil.NewTestRand()
+	rng, _ := randutil.NewPseudoRand()
 	randBytes := randutil.RandBytes(rng, int(conf.RangeMinBytes))
 
 	lhsStartKey := roachpb.RKey(tc.ScratchRange(t))
