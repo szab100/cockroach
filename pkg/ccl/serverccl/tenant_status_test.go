@@ -11,10 +11,8 @@ package serverccl
 import (
 	"context"
 	gosql "database/sql"
-	"encoding/hex"
 	"fmt"
 	"net/url"
-	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,14 +29,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/idxusage"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -118,31 +113,13 @@ func TestTenantCannotSeeNonTenantStats(t *testing.T) {
 	require.NoError(t, err)
 
 	request := &serverpb.StatementsRequest{}
+
+	tenantStats, err := tenantStatusServer.Statements(ctx, request)
+	require.NoError(t, err)
+
 	combinedStatsRequest := &serverpb.CombinedStatementsStatsRequest{}
-	var tenantStats *serverpb.StatementsResponse
-	var tenantCombinedStats *serverpb.StatementsResponse
-
-	// Populate `tenantStats` and `tenantCombinedStats`. The tenant server
-	// `Statements` and `CombinedStatements` methods are backed by the
-	// sqlinstance system which uses a cache populated through rangefeed
-	// for keeping track of SQL pod data. We use `SucceedsSoon` to eliminate
-	// race condition with the sqlinstance cache population such as during
-	// a stress test.
-	testutils.SucceedsSoon(t, func() error {
-		tenantStats, err = tenantStatusServer.Statements(ctx, request)
-		if err != nil {
-			return err
-		}
-		if tenantStats == nil || len(tenantStats.Statements) == 0 {
-			return errors.New("tenant statements are unexpectedly empty")
-		}
-
-		tenantCombinedStats, err = tenantStatusServer.CombinedStatementStats(ctx, combinedStatsRequest)
-		if tenantCombinedStats == nil || len(tenantCombinedStats.Statements) == 0 {
-			return errors.New("tenant combined statements are unexpectedly empty")
-		}
-		return nil
-	})
+	tenantCombinedStats, err := tenantStatusServer.CombinedStatementStats(ctx, combinedStatsRequest)
+	require.NoError(t, err)
 
 	path := "/_status/statements"
 	var nonTenantStats serverpb.StatementsResponse
@@ -318,142 +295,6 @@ func TestResetSQLStatsRPCForTenant(t *testing.T) {
 
 			ensureExpectedStmtFingerprintExistsInRPCResponse(t, stmts, statsFromControlCluster, "control")
 		})
-	}
-}
-
-func TestResetIndexUsageStatsRPCForTenant(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	skip.UnderStressRace(t, "expensive tests")
-
-	ctx := context.Background()
-
-	statsIngestionCb, statsIngestionNotifier := idxusage.CreateIndexStatsIngestedCallbackForTest()
-
-	knobs := tests.CreateTestingKnobs()
-	knobs.IndexUsageStatsKnobs = &idxusage.TestingKnobs{
-		OnIndexUsageStatsProcessedCallback: statsIngestionCb,
-	}
-
-	testHelper := newTestTenantHelper(t, 3 /* tenantClusterSize */, knobs)
-	defer testHelper.cleanup(ctx, t)
-
-	testingCluster := testHelper.testCluster()
-	controlCluster := testHelper.controlCluster()
-	var testingTableID, controlTableID string
-
-	for i, cluster := range []tenantCluster{testingCluster, controlCluster} {
-		// Create tables and insert data.
-		cluster.tenantConn(0).Exec(t, `
-CREATE TABLE test (
-  k INT PRIMARY KEY,
-  a INT,
-  b INT,
-  INDEX(a)
-)
-`)
-
-		cluster.tenantConn(0).Exec(t, `
-INSERT INTO test
-VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)
-`)
-
-		// Record scan on primary index.
-		cluster.tenantConn(0).Exec(t, "SELECT * FROM test")
-
-		// Record scan on secondary index.
-		cluster.tenantConn(1).Exec(t, "SELECT * FROM test@test_a_idx")
-		testTableIDStr := cluster.tenantConn(2).QueryStr(t, "SELECT 'test'::regclass::oid")[0][0]
-		testTableID, err := strconv.Atoi(testTableIDStr)
-		require.NoError(t, err)
-
-		// Set table ID outside of loop.
-		if i == 0 {
-			testingTableID = testTableIDStr
-		} else {
-			controlTableID = testTableIDStr
-		}
-
-		// Wait for the stats to be ingested.
-		require.NoError(t,
-			idxusage.WaitForIndexStatsIngestionForTest(statsIngestionNotifier, map[roachpb.IndexUsageKey]struct{}{
-				{
-					TableID: roachpb.TableID(testTableID),
-					IndexID: 1,
-				}: {},
-				{
-					TableID: roachpb.TableID(testTableID),
-					IndexID: 2,
-				}: {},
-			}, 2 /* expectedEventCnt*/, 5*time.Second /* timeout */),
-		)
-
-		query := `
-SELECT
-  table_id,
-  index_id,
-  total_reads,
-  extract_duration('second', now() - last_read) < 5
-FROM
-  crdb_internal.index_usage_statistics
-WHERE
-  table_id = ` + testTableIDStr
-		// Assert index usage data was inserted.
-		expected := [][]string{
-			{testTableIDStr, "1", "1", "true"},
-			{testTableIDStr, "2", "1", "true"},
-		}
-		cluster.tenantConn(2).CheckQueryResults(t, query, expected)
-	}
-
-	// Reset index usage stats.
-	timePreReset := timeutil.Now()
-	status := testingCluster.tenantStatusSrv(1 /* idx */)
-	_, err := status.ResetIndexUsageStats(ctx, &serverpb.ResetIndexUsageStatsRequest{})
-	require.NoError(t, err)
-
-	// Check that last reset time was updated for test cluster.
-	resp, err := status.IndexUsageStatistics(ctx, &serverpb.IndexUsageStatisticsRequest{})
-	require.NoError(t, err)
-	require.True(t, resp.LastReset.After(timePreReset))
-
-	// Ensure tenant data isolation.
-	// Check that last reset time was not updated for control cluster.
-	status = controlCluster.tenantStatusSrv(1 /* idx */)
-	resp, err = status.IndexUsageStatistics(ctx, &serverpb.IndexUsageStatisticsRequest{})
-	require.NoError(t, err)
-	require.Equal(t, resp.LastReset, time.Time{})
-
-	// Query to fetch index usage stats. We do this instead of sending
-	// an RPC request so that we can filter by table id.
-	query := `
-SELECT
-  table_id,
-  total_reads,
-  last_read
-FROM
-  crdb_internal.index_usage_statistics
-WHERE
-  table_id = $1
-`
-
-	// Check that index usage stats were reset.
-	rows := testingCluster.tenantConn(2).QueryStr(t, query, testingTableID)
-	require.NotNil(t, rows)
-	for _, row := range rows {
-		require.Equal(t, row[1], "0", "expected total reads for table %s to be reset, but got %s",
-			row[0], row[1])
-		require.Equal(t, row[2], "NULL", "expected last read time for table %s to be reset, but got %s",
-			row[0], row[2])
-	}
-
-	// Ensure tenant data isolation.
-	rows = controlCluster.tenantConn(2).QueryStr(t, query, controlTableID)
-	require.NotNil(t, rows)
-	for _, row := range rows {
-		require.NotEqual(t, row[1], "0", "expected total reads for table %s to not be reset, but got %s", row[0], row[1])
-		require.NotEqual(t, row[2], "NULL", "expected last read time for table %s to not be reset, but got %s", row[0], row[2])
 	}
 }
 
@@ -634,148 +475,4 @@ WHERE
 	expected = [][]string{}
 
 	require.Equal(t, expected, actual)
-}
-
-func selectClusterSessionIDs(t *testing.T, conn *sqlutils.SQLRunner) []string {
-	var sessionIDs []string
-	rows := conn.QueryStr(t, "SELECT session_id FROM crdb_internal.cluster_sessions")
-	for _, row := range rows {
-		sessionIDs = append(sessionIDs, row[0])
-	}
-	return sessionIDs
-}
-
-func TestTenantStatusCancelSession(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	skip.UnderStressRace(t, "expensive tests")
-
-	ctx := context.Background()
-	helper := newTestTenantHelper(t, 3, base.TestingKnobs{})
-	defer helper.cleanup(ctx, t)
-
-	// Open a SQL session on tenant SQL pod 0.
-	sqlPod0 := helper.testCluster().tenantConn(0)
-	sqlPod0.Exec(t, "SELECT 1")
-
-	// See the session over HTTP on tenant SQL pod 1.
-	httpPod1, err := helper.testCluster().tenantHTTPJSONClient(1)
-	require.NoError(t, err)
-	defer httpPod1.Close()
-	listSessionsResp := serverpb.ListSessionsResponse{}
-	err = httpPod1.GetJSON("/_status/sessions", &listSessionsResp)
-	require.NoError(t, err)
-	var session serverpb.Session
-	for _, s := range listSessionsResp.Sessions {
-		if s.LastActiveQuery == "SELECT 1" {
-			session = s
-			break
-		}
-	}
-	require.NotNil(t, session.ID, "session not found")
-
-	// See the session over SQL on tenant SQL pod 0.
-	require.Contains(t, selectClusterSessionIDs(t, sqlPod0), hex.EncodeToString(session.ID))
-
-	// Cancel the session over HTTP from tenant SQL pod 1.
-	cancelSessionReq := serverpb.CancelSessionRequest{SessionID: session.ID}
-	cancelSessionResp := serverpb.CancelSessionResponse{}
-	err = httpPod1.PostJSON("/_status/cancel_session/"+session.NodeID.String(), &cancelSessionReq, &cancelSessionResp)
-	require.NoError(t, err)
-	require.Equal(t, true, cancelSessionResp.Canceled, cancelSessionResp.Error)
-
-	// No longer see the session over SQL from tenant SQL pod 0.
-	// (The SQL client maintains an internal connection pool and automatically reconnects.)
-	require.NotContains(t, selectClusterSessionIDs(t, sqlPod0), hex.EncodeToString(session.ID))
-
-	// Attempt to cancel the session again over HTTP from tenant SQL pod 1, so that we can see the error message.
-	err = httpPod1.PostJSON("/_status/cancel_session/"+session.NodeID.String(), &cancelSessionReq, &cancelSessionResp)
-	require.NoError(t, err)
-	require.Equal(t, false, cancelSessionResp.Canceled)
-	require.Equal(t, fmt.Sprintf("session ID %s not found", hex.EncodeToString(session.ID)), cancelSessionResp.Error)
-}
-
-func selectClusterQueryIDs(t *testing.T, conn *sqlutils.SQLRunner) []string {
-	var queryIDs []string
-	rows := conn.QueryStr(t, "SELECT query_id FROM crdb_internal.cluster_queries")
-	for _, row := range rows {
-		queryIDs = append(queryIDs, row[0])
-	}
-	return queryIDs
-}
-
-func TestTenantStatusCancelQuery(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	skip.UnderStressRace(t, "expensive tests")
-
-	ctx := context.Background()
-	helper := newTestTenantHelper(t, 3, base.TestingKnobs{})
-	defer helper.cleanup(ctx, t)
-
-	// Open a SQL session on tenant SQL pod 0 and start a long-running query.
-	sqlPod0 := helper.testCluster().tenantConn(0)
-	results := make(chan struct{})
-	errors := make(chan error)
-	defer close(results)
-	defer close(errors)
-	go func() {
-		if _, err := sqlPod0.DB.ExecContext(ctx, "SELECT pg_sleep(60)"); err != nil {
-			errors <- err
-		} else {
-			results <- struct{}{}
-		}
-	}()
-
-	// See the query over HTTP on tenant SQL pod 1.
-	httpPod1, err := helper.testCluster().tenantHTTPJSONClient(1)
-	require.NoError(t, err)
-	defer httpPod1.Close()
-	var listSessionsResp serverpb.ListSessionsResponse
-	var query serverpb.ActiveQuery
-	require.Eventually(t, func() bool {
-		err = httpPod1.GetJSON("/_status/sessions", &listSessionsResp)
-		require.NoError(t, err)
-		for _, s := range listSessionsResp.Sessions {
-			for _, q := range s.ActiveQueries {
-				if q.Sql == "SELECT pg_sleep(60)" {
-					query = q
-					break
-				}
-			}
-		}
-		return query.ID != ""
-	}, 10*time.Second, 100*time.Millisecond, "query not found")
-
-	// See the query over SQL on tenant SQL pod 0.
-	require.Contains(t, selectClusterQueryIDs(t, sqlPod0), query.ID)
-
-	// Cancel the query over HTTP on tenant SQL pod 1.
-	cancelQueryReq := serverpb.CancelQueryRequest{QueryID: query.ID}
-	cancelQueryResp := serverpb.CancelQueryResponse{}
-	err = httpPod1.PostJSON("/_status/cancel_query/0", &cancelQueryReq, &cancelQueryResp)
-	require.NoError(t, err)
-	require.Equal(t, true, cancelQueryResp.Canceled,
-		"expected query to be canceled, but encountered unexpected error %s", cancelQueryResp.Error)
-
-	// No longer see the query over SQL on tenant SQL pod 0.
-	require.Eventually(t, func() bool {
-		return !strings.Contains(reflect.ValueOf(selectClusterQueryIDs(t, sqlPod0)).String(), query.ID)
-	}, 10*time.Second, 100*time.Millisecond,
-		"expected query %s to no longer be visible in crdb_internal.cluster_queries", query.ID)
-
-	select {
-	case <-results:
-		t.Fatalf("Expected long-running query to have been canceled with error.")
-	case err := <-errors:
-		require.Equal(t, "pq: query execution canceled", err.Error())
-	}
-
-	// Attempt to cancel the query again over HTTP from tenant SQL pod 1, so that we can see the error message.
-	err = httpPod1.PostJSON("/_status/cancel_query/0", &cancelQueryReq, &cancelQueryResp)
-	require.NoError(t, err)
-	require.Equal(t, false, cancelQueryResp.Canceled)
-	require.Equal(t, fmt.Sprintf("query ID %s not found", query.ID), cancelQueryResp.Error)
 }

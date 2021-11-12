@@ -317,7 +317,9 @@ func (f *kvFeed) scanIfShould(
 
 	// If we have initial checkpoint information specified, filter out
 	// spans which we no longer need to scan.
-	spansToBackfill = filterCheckpointSpans(spansToBackfill, f.checkpoint)
+	if initialScan {
+		spansToBackfill = filterCheckpointSpans(spansToBackfill, f.checkpoint)
+	}
 
 	if (!isInitialScan && f.schemaChangePolicy == changefeedbase.OptSchemaChangePolicyNoBackfill) ||
 		len(spansToBackfill) == 0 {
@@ -459,12 +461,6 @@ func copyFromSourceToDestUntilTableEvent(
 					return false, false, err
 				}
 				return true, frontier.Frontier().EqOrdering(boundaryResolvedTimestamp), nil
-			case kvevent.TypeFlush:
-				// TypeFlush events have a timestamp of zero and should have already
-				// been processed by the timestamp check above. We include this here
-				// for completeness.
-				return false, false, nil
-
 			default:
 				return false, false, &errUnknownEvent{e}
 			}

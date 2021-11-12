@@ -29,16 +29,15 @@ func registerPebble(r registry.Registry) {
 		pebble = "./pebble.linux"
 	}
 
-	run := func(ctx context.Context, t test.Test, c cluster.Cluster, size int, dur int64) {
+	run := func(ctx context.Context, t test.Test, c cluster.Cluster, size int) {
 		c.Put(ctx, pebble, "./pebble")
 
 		const initialKeys = 10_000_000
 		const cache = 4 << 30 // 4 GB
+		const duration = 10 * time.Minute
 		const dataDir = "$(dirname {store-dir})"
 		const dataTar = dataDir + "/data.tar"
 		const benchDir = dataDir + "/bench"
-
-		var duration = time.Duration(dur) * time.Minute
 
 		runCmd := func(cmd string) {
 			t.L().PrintfCtx(ctx, "> %s", cmd)
@@ -104,25 +103,17 @@ func registerPebble(r registry.Registry) {
 		}
 	}
 
-	for _, dur := range []int64{10, 90} {
-		for _, size := range []int{64, 1024} {
-			size := size
-			var tag string
-			if dur == 90 {
-				tag = "pebble_nightly"
-			} else {
-				tag = "pebble"
-			}
-			r.Add(registry.TestSpec{
-				Name:    fmt.Sprintf("pebble/ycsb/size=%d/duration=%d", size, dur),
-				Owner:   registry.OwnerStorage,
-				Timeout: 12 * time.Hour,
-				Cluster: r.MakeClusterSpec(5, spec.CPU(16)),
-				Tags:    []string{tag},
-				Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-					run(ctx, t, c, size, dur)
-				},
-			})
-		}
+	for _, size := range []int{64, 1024} {
+		size := size
+		r.Add(registry.TestSpec{
+			Name:    fmt.Sprintf("pebble/ycsb/size=%d", size),
+			Owner:   registry.OwnerStorage,
+			Timeout: 2 * time.Hour,
+			Cluster: r.MakeClusterSpec(5, spec.CPU(16)),
+			Tags:    []string{"pebble"},
+			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+				run(ctx, t, c, size)
+			},
+		})
 	}
 }
