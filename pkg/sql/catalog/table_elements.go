@@ -119,6 +119,7 @@ type Index interface {
 
 	GetID() descpb.IndexID
 	GetName() string
+	IsInterleaved() bool
 	IsPartial() bool
 	IsUnique() bool
 	IsDisabled() bool
@@ -139,6 +140,12 @@ type Index interface {
 	GetPartitioning() Partitioning
 
 	ExplicitColumnStartIdx() int
+
+	NumInterleaveAncestors() int
+	GetInterleaveAncestor(ancestorOrdinal int) descpb.InterleaveDescriptor_Ancestor
+
+	NumInterleavedBy() int
+	GetInterleavedBy(interleavedByOrdinal int) descpb.ForeignKeyReference
 
 	NumKeyColumns() int
 	GetKeyColumnID(columnOrdinal int) descpb.ColumnID
@@ -167,7 +174,7 @@ type Index interface {
 	GetCompositeColumnID(compositeColumnOrdinal int) descpb.ColumnID
 }
 
-// Column is an interface around the column descriptor types.
+// Column is an interface around the index descriptor types.
 type Column interface {
 	TableElementMaybeMutation
 
@@ -655,18 +662,18 @@ func ColumnIDToOrdinalMap(columns []Column) TableColMap {
 
 // ColumnTypes returns the types of the given columns
 func ColumnTypes(columns []Column) []*types.T {
-	return ColumnTypesWithInvertedCol(columns, nil /* invertedCol */)
+	return ColumnTypesWithVirtualCol(columns, nil)
 }
 
-// ColumnTypesWithInvertedCol returns the types of all given columns,
-// If invertedCol is non-nil, substitutes the type of the inverted
+// ColumnTypesWithVirtualCol returns the types of all given columns,
+// If virtualCol is non-nil, substitutes the type of the virtual
 // column instead of the column with the same ID.
-func ColumnTypesWithInvertedCol(columns []Column, invertedCol Column) []*types.T {
+func ColumnTypesWithVirtualCol(columns []Column, virtualCol Column) []*types.T {
 	t := make([]*types.T, len(columns))
 	for i, col := range columns {
 		t[i] = col.GetType()
-		if invertedCol != nil && col.GetID() == invertedCol.GetID() {
-			t[i] = invertedCol.GetType()
+		if virtualCol != nil && col.GetID() == virtualCol.GetID() {
+			t[i] = virtualCol.GetType()
 		}
 	}
 	return t

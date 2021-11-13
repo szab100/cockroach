@@ -41,7 +41,7 @@ import Visualization from "src/views/cluster/components/visualization";
 import { MilliToSeconds, NanoToMilli } from "src/util/convert";
 import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
-import { findClosestTimeScale, TimeWindow } from "src/redux/timewindow";
+import { findClosestTimeScale } from "src/redux/timewindow";
 
 type TSResponse = protos.cockroach.ts.tspb.TimeSeriesQueryResponse;
 
@@ -54,7 +54,6 @@ export interface LineGraphProps extends MetricsDataComponentProps {
   hoverOn?: typeof hoverOn;
   hoverOff?: typeof hoverOff;
   hoverState?: HoverState;
-  preCalcGraphSize?: boolean;
 }
 
 interface LineGraphStateOld {
@@ -406,18 +405,11 @@ export class LineGraph extends React.Component<LineGraphProps, {}> {
     if (startMillis === endMillis) return;
     const start = MilliToSeconds(startMillis);
     const end = MilliToSeconds(endMillis);
-    const newTimeWindow: TimeWindow = {
+    this.props.setTimeRange({
       start: moment.unix(start),
       end: moment.unix(end),
-    };
-    let newTimeScale = findClosestTimeScale(end - start, start);
-    if (this.props.adjustTimeScaleOnChange) {
-      newTimeScale = this.props.adjustTimeScaleOnChange(
-        newTimeScale,
-        newTimeWindow,
-      );
-    }
-    this.props.setTimeRange(newTimeWindow);
+    });
+    const newTimeScale = findClosestTimeScale(end - start);
     this.props.setTimeScale(newTimeScale);
     const { pathname, search } = this.props.history.location;
     const urlParams = new URLSearchParams(search);
@@ -452,8 +444,9 @@ export class LineGraph extends React.Component<LineGraphProps, {}> {
 
   componentDidUpdate(prevProps: Readonly<LineGraphProps>) {
     if (
-      !this.props.data?.results ||
-      (prevProps.data === this.props.data && this.u !== undefined)
+      !this.props.data ||
+      !this.props.data.results ||
+      prevProps.data === this.props.data
     ) {
       return;
     }
@@ -524,7 +517,7 @@ export class LineGraph extends React.Component<LineGraphProps, {}> {
   }
 
   render() {
-    const { title, subtitle, tooltip, data, preCalcGraphSize } = this.props;
+    const { title, subtitle, tooltip, data } = this.props;
 
     return (
       <Visualization
@@ -532,7 +525,6 @@ export class LineGraph extends React.Component<LineGraphProps, {}> {
         subtitle={subtitle}
         tooltip={tooltip}
         loading={!data}
-        preCalcGraphSize={preCalcGraphSize}
       >
         <div className="linegraph">
           <div ref={this.el} />

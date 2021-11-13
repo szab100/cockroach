@@ -29,16 +29,15 @@ func registerPebble(r registry.Registry) {
 		pebble = "./pebble.linux"
 	}
 
-	run := func(ctx context.Context, t test.Test, c cluster.Cluster, size int, dur int64) {
+	run := func(ctx context.Context, t test.Test, c cluster.Cluster, size int) {
 		c.Put(ctx, pebble, "./pebble")
 
 		const initialKeys = 10_000_000
 		const cache = 4 << 30 // 4 GB
+		const duration = 10 * time.Minute
 		const dataDir = "$(dirname {store-dir})"
 		const dataTar = dataDir + "/data.tar"
 		const benchDir = dataDir + "/bench"
-
-		var duration = time.Duration(dur) * time.Minute
 
 		runCmd := func(cmd string) {
 			t.L().PrintfCtx(ctx, "> %s", cmd)
@@ -104,39 +103,17 @@ func registerPebble(r registry.Registry) {
 		}
 	}
 
-	// Generate roachtests that run for both 10 minutes and 90 minutes. The former
-	// is useful for local testing, while the latter is used to populate the
-	// Pebble Nightly benchmarks.
-	for _, dur := range []int64{10, 90} {
-		for _, size := range []int{64, 1024} {
-			size := size
-
-			// NOTE: This test name should not change for benchmark data that gets
-			// persisted to S3, as it is relied-upon by the Pebble mkbench command,
-			// which creates a well-known directory structure that is in-turn
-			// relied-upon by the javascript on the Pebble Benchmarks webpage.
-			name := fmt.Sprintf("pebble/ycsb/size=%d", size)
-			tag := "pebble_nightly"
-
-			// For the shorter benchmark runs, we append a suffix to the name to avoid
-			// a name collision. This is safe to do as these tests are not executed as
-			// part of the nightly benchmark runs (see the tag used to filter, found
-			// in build/teamcity-nightly-pebble.sh).
-			if dur != 90 {
-				tag = "pebble"
-				name += "-short"
-			}
-
-			r.Add(registry.TestSpec{
-				Name:    name,
-				Owner:   registry.OwnerStorage,
-				Timeout: 12 * time.Hour,
-				Cluster: r.MakeClusterSpec(5, spec.CPU(16)),
-				Tags:    []string{tag},
-				Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-					run(ctx, t, c, size, dur)
-				},
-			})
-		}
+	for _, size := range []int{64, 1024} {
+		size := size
+		r.Add(registry.TestSpec{
+			Name:    fmt.Sprintf("pebble/ycsb/size=%d", size),
+			Owner:   registry.OwnerStorage,
+			Timeout: 2 * time.Hour,
+			Cluster: r.MakeClusterSpec(5, spec.CPU(16)),
+			Tags:    []string{"pebble"},
+			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+				run(ctx, t, c, size)
+			},
+		})
 	}
 }

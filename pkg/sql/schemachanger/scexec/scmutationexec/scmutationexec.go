@@ -15,132 +15,67 @@ import (
 	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/seqexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec/descriptorutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 )
 
-// CatalogReader describes catalog read operations as required by the mutation
-// visitor.
-type CatalogReader interface {
-	// MustReadImmutableDescriptor reads a descriptor from the catalog by ID.
-	MustReadImmutableDescriptor(ctx context.Context, id descpb.ID) (catalog.Descriptor, error)
-
-	// AddSyntheticDescriptor adds a synthetic descriptor to the reader state.
-	// Subsequent calls to MustReadImmutableDescriptor for this ID will return
-	// this synthetic descriptor instead of what it would have otherwise returned.
-	AddSyntheticDescriptor(desc catalog.Descriptor)
-
-	// RemoveSyntheticDescriptor undoes the effects of AddSyntheticDescriptor.
-	RemoveSyntheticDescriptor(id descpb.ID)
-
-	// AddPartitioning adds partitioning information on an index descriptor.
-	AddPartitioning(
-		tableDesc *tabledesc.Mutable,
-		indexDesc *descpb.IndexDescriptor,
-		partitionFields []string,
-		listPartition []*scpb.ListPartition,
-		rangePartition []*scpb.RangePartitions,
-		allowedNewColumnNames []tree.Name,
-		allowImplicitPartitioning bool,
-	) error
+// DescriptorReader encapsulates logic used to retrieve
+// and track modified descriptors.
+type DescriptorReader interface {
+	GetMutableTypeByID(ctx context.Context, id descpb.ID) (*typedesc.Mutable, error)
+	GetImmutableDatabaseByID(ctx context.Context, id descpb.ID) (catalog.DatabaseDescriptor, error)
+	GetMutableTableByID(ctx context.Context, id descpb.ID) (*tabledesc.Mutable, error)
+	GetAnyDescriptorByID(ctx context.Context, id descpb.ID) (catalog.MutableDescriptor, error)
+	AddDrainedName(id descpb.ID, nameInfo descpb.NameInfo)
 }
 
-// MutationVisitorStateUpdater is the interface for updating the visitor state.
-type MutationVisitorStateUpdater interface {
-
-	// CheckOutDescriptor reads a descriptor from the catalog by ID and marks it
-	// as undergoing a change.
-	CheckOutDescriptor(ctx context.Context, id descpb.ID) (catalog.MutableDescriptor, error)
-
-	// AddDrainedName marks a namespace entry as being drained.
+// NamespaceWriter encapsulates operations used to manipulate
+// namespaces.
+type NamespaceWriter interface {
 	AddDrainedName(id descpb.ID, nameInfo descpb.NameInfo)
+}
 
-	// AddNewGCJobForDescriptor enqueues a GC job for the given descriptor.
+// CommentWriter encapsulates operations used to manipulate
+// object comments.
+type CommentWriter interface {
+	RemoveObjectComments(ctx context.Context, id descpb.ID) error
+}
+
+// Catalog encapsulates the logic to modify descriptors,
+// namespaces, comments to help support schema changer mutations.
+type Catalog interface {
+	DescriptorReader
+	NamespaceWriter
+	CommentWriter
+}
+
+// MutationJobs encapsulates the logic to create different types
+// of jobs.
+type MutationJobs interface {
 	AddNewGCJobForDescriptor(descriptor catalog.Descriptor)
 }
 
 // NewMutationVisitor creates a new scop.MutationVisitor.
-func NewMutationVisitor(cr CatalogReader, s MutationVisitorStateUpdater) scop.MutationVisitor {
-	return &visitor{
-		cr: cr,
-		s:  s,
-	}
+func NewMutationVisitor(catalog Catalog, jobs MutationJobs) scop.MutationVisitor {
+	return &visitor{catalog: catalog, jobs: jobs}
 }
 
 type visitor struct {
-	cr CatalogReader
-	s  MutationVisitorStateUpdater
-}
-
-func (m *visitor) checkOutTable(ctx context.Context, id descpb.ID) (*tabledesc.Mutable, error) {
-	desc, err := m.s.CheckOutDescriptor(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	mut, ok := desc.(*tabledesc.Mutable)
-	if !ok {
-		return nil, catalog.WrapTableDescRefErr(id, catalog.NewDescriptorTypeError(desc))
-	}
-	return mut, nil
-}
-
-func (m *visitor) checkOutDatabase(ctx context.Context, id descpb.ID) (*dbdesc.Mutable, error) {
-	desc, err := m.s.CheckOutDescriptor(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	mut, ok := desc.(*dbdesc.Mutable)
-	if !ok {
-		return nil, catalog.WrapDatabaseDescRefErr(id, catalog.NewDescriptorTypeError(desc))
-	}
-	return mut, nil
-}
-
-// Stop the linter from complaining.
-var _ = ((*visitor)(nil)).checkOutDatabase
-
-func (m *visitor) checkOutSchema(ctx context.Context, id descpb.ID) (*schemadesc.Mutable, error) {
-	desc, err := m.s.CheckOutDescriptor(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	mut, ok := desc.(*schemadesc.Mutable)
-	if !ok {
-		return nil, catalog.WrapSchemaDescRefErr(id, catalog.NewDescriptorTypeError(desc))
-	}
-	return mut, nil
-}
-
-// Stop the linter from complaining.
-var _ = ((*visitor)(nil)).checkOutSchema
-
-func (m *visitor) checkOutType(ctx context.Context, id descpb.ID) (*typedesc.Mutable, error) {
-	desc, err := m.s.CheckOutDescriptor(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	mut, ok := desc.(*typedesc.Mutable)
-	if !ok {
-		return nil, catalog.WrapTypeDescRefErr(id, catalog.NewDescriptorTypeError(desc))
-	}
-	return mut, nil
+	catalog Catalog
+	jobs    MutationJobs
 }
 
 func (m *visitor) MakeAddedColumnDeleteAndWriteOnly(
 	ctx context.Context, op scop.MakeAddedColumnDeleteAndWriteOnly,
 ) error {
-	table, err := m.checkOutTable(ctx, op.TableID)
+	table, err := m.catalog.GetMutableTableByID(ctx, op.TableID)
 	if err != nil {
 		return err
 	}
@@ -155,7 +90,7 @@ func (m *visitor) MakeAddedColumnDeleteAndWriteOnly(
 
 func (m *visitor) UpdateRelationDeps(ctx context.Context, op scop.UpdateRelationDeps) error {
 	// TODO(fqazi): Only implemented for sequences.
-	tableDesc, err := m.checkOutTable(ctx, op.TableID)
+	tableDesc, err := m.catalog.GetMutableTableByID(ctx, op.TableID)
 	if err != nil {
 		return err
 	}
@@ -202,7 +137,7 @@ func (m *visitor) RemoveColumnDefaultExpression(
 	ctx context.Context, op scop.RemoveColumnDefaultExpression,
 ) error {
 	// Remove the descriptors namespaces as the last stage
-	tableDesc, err := m.checkOutTable(ctx, op.TableID)
+	tableDesc, err := m.catalog.GetMutableTableByID(ctx, op.TableID)
 	if err != nil {
 		return err
 	}
@@ -218,13 +153,13 @@ func (m *visitor) RemoveColumnDefaultExpression(
 }
 
 func (m *visitor) AddTypeBackRef(ctx context.Context, op scop.AddTypeBackRef) error {
-	mutDesc, err := m.checkOutType(ctx, op.TypeID)
+	mutDesc, err := m.catalog.GetMutableTypeByID(ctx, op.TypeID)
 	if err != nil {
 		return err
 	}
 	mutDesc.AddReferencingDescriptorID(op.DescID)
 	// Sanity: Validate that a back reference exists by now.
-	desc, err := m.cr.MustReadImmutableDescriptor(ctx, op.DescID)
+	desc, err := m.catalog.GetAnyDescriptorByID(ctx, op.DescID)
 	if err != nil {
 		return err
 	}
@@ -243,7 +178,7 @@ func (m *visitor) RemoveRelationDependedOnBy(
 	ctx context.Context, op scop.RemoveRelationDependedOnBy,
 ) error {
 	// Remove the descriptors namespaces as the last stage
-	tableDesc, err := m.checkOutTable(ctx, op.TableID)
+	tableDesc, err := m.catalog.GetMutableTableByID(ctx, op.TableID)
 	if err != nil {
 		return err
 	}
@@ -257,7 +192,7 @@ func (m *visitor) RemoveRelationDependedOnBy(
 }
 
 func (m *visitor) RemoveSequenceOwnedBy(ctx context.Context, op scop.RemoveSequenceOwnedBy) error {
-	mutDesc, err := m.checkOutTable(ctx, op.TableID)
+	mutDesc, err := m.catalog.GetMutableTableByID(ctx, op.TableID)
 	if err != nil {
 		return err
 	}
@@ -267,7 +202,7 @@ func (m *visitor) RemoveSequenceOwnedBy(ctx context.Context, op scop.RemoveSeque
 }
 
 func (m *visitor) RemoveTypeBackRef(ctx context.Context, op scop.RemoveTypeBackRef) error {
-	mutDesc, err := m.checkOutType(ctx, op.TypeID)
+	mutDesc, err := m.catalog.GetMutableTypeByID(ctx, op.TypeID)
 	if err != nil {
 		return err
 	}
@@ -278,42 +213,28 @@ func (m *visitor) RemoveTypeBackRef(ctx context.Context, op scop.RemoveTypeBackR
 func (m *visitor) CreateGcJobForDescriptor(
 	ctx context.Context, op scop.CreateGcJobForDescriptor,
 ) error {
-	desc, err := m.cr.MustReadImmutableDescriptor(ctx, op.DescID)
+	desc, err := m.catalog.GetAnyDescriptorByID(ctx, op.DescID)
 	if err != nil {
 		return err
 	}
-	m.s.AddNewGCJobForDescriptor(desc)
+	m.jobs.AddNewGCJobForDescriptor(desc)
 	return nil
 }
 
 func (m *visitor) MarkDescriptorAsDropped(
 	ctx context.Context, op scop.MarkDescriptorAsDropped,
 ) error {
-	// Before we can mutate the descriptor, get rid of any synthetic descriptor.
-	m.cr.RemoveSyntheticDescriptor(op.DescID)
-	desc, err := m.s.CheckOutDescriptor(ctx, op.DescID)
+	descriptor, err := m.catalog.GetAnyDescriptorByID(ctx, op.TableID)
 	if err != nil {
 		return err
 	}
-	desc.SetDropped()
-	return nil
-}
-
-func (m *visitor) MarkDescriptorAsDroppedSynthetically(
-	ctx context.Context, op scop.MarkDescriptorAsDroppedSynthetically,
-) error {
-	desc, err := m.cr.MustReadImmutableDescriptor(ctx, op.DescID)
-	if err != nil {
-		return err
-	}
-	mut := desc.NewBuilder().BuildCreatedMutable()
-	mut.SetDropped()
-	m.cr.AddSyntheticDescriptor(mut)
+	// Mark table as dropped
+	descriptor.SetDropped()
 	return nil
 }
 
 func (m *visitor) DrainDescriptorName(ctx context.Context, op scop.DrainDescriptorName) error {
-	descriptor, err := m.cr.MustReadImmutableDescriptor(ctx, op.TableID)
+	descriptor, err := m.catalog.GetAnyDescriptorByID(ctx, op.TableID)
 	if err != nil {
 		return err
 	}
@@ -322,12 +243,12 @@ func (m *visitor) DrainDescriptorName(ctx context.Context, op scop.DrainDescript
 		ParentID:       descriptor.GetParentID(),
 		ParentSchemaID: descriptor.GetParentSchemaID(),
 		Name:           descriptor.GetName()}
-	m.s.AddDrainedName(descriptor.GetID(), nameDetails)
+	m.catalog.AddDrainedName(descriptor.GetID(), nameDetails)
 	return nil
 }
 
 func (m *visitor) MakeColumnPublic(ctx context.Context, op scop.MakeColumnPublic) error {
-	table, err := m.checkOutTable(ctx, op.TableID)
+	table, err := m.catalog.GetMutableTableByID(ctx, op.TableID)
 	if err != nil {
 		return err
 	}
@@ -351,7 +272,7 @@ func (m *visitor) MakeColumnPublic(ctx context.Context, op scop.MakeColumnPublic
 func (m *visitor) MakeDroppedNonPrimaryIndexDeleteAndWriteOnly(
 	ctx context.Context, op scop.MakeDroppedNonPrimaryIndexDeleteAndWriteOnly,
 ) error {
-	table, err := m.checkOutTable(ctx, op.TableID)
+	table, err := m.catalog.GetMutableTableByID(ctx, op.TableID)
 	if err != nil {
 		return err
 	}
@@ -374,7 +295,7 @@ func (m *visitor) MakeDroppedNonPrimaryIndexDeleteAndWriteOnly(
 func (m *visitor) MakeDroppedColumnDeleteAndWriteOnly(
 	ctx context.Context, op scop.MakeDroppedColumnDeleteAndWriteOnly,
 ) error {
-	table, err := m.checkOutTable(ctx, op.TableID)
+	table, err := m.catalog.GetMutableTableByID(ctx, op.TableID)
 	if err != nil {
 		return err
 	}
@@ -397,7 +318,7 @@ func (m *visitor) MakeDroppedColumnDeleteAndWriteOnly(
 func (m *visitor) MakeDroppedColumnDeleteOnly(
 	ctx context.Context, op scop.MakeDroppedColumnDeleteOnly,
 ) error {
-	table, err := m.checkOutTable(ctx, op.TableID)
+	table, err := m.catalog.GetMutableTableByID(ctx, op.TableID)
 	if err != nil {
 		return err
 	}
@@ -411,7 +332,7 @@ func (m *visitor) MakeDroppedColumnDeleteOnly(
 }
 
 func (m *visitor) MakeColumnAbsent(ctx context.Context, op scop.MakeColumnAbsent) error {
-	table, err := m.checkOutTable(ctx, op.TableID)
+	table, err := m.catalog.GetMutableTableByID(ctx, op.TableID)
 	if err != nil {
 		return err
 	}
@@ -432,7 +353,7 @@ func (m *visitor) MakeColumnAbsent(ctx context.Context, op scop.MakeColumnAbsent
 func (m *visitor) MakeAddedIndexDeleteAndWriteOnly(
 	ctx context.Context, op scop.MakeAddedIndexDeleteAndWriteOnly,
 ) error {
-	table, err := m.checkOutTable(ctx, op.TableID)
+	table, err := m.catalog.GetMutableTableByID(ctx, op.TableID)
 	if err != nil {
 		return err
 	}
@@ -448,40 +369,37 @@ func (m *visitor) MakeAddedIndexDeleteAndWriteOnly(
 func (m *visitor) MakeAddedColumnDeleteOnly(
 	ctx context.Context, op scop.MakeAddedColumnDeleteOnly,
 ) error {
-	table, err := m.checkOutTable(ctx, op.TableID)
+	table, err := m.catalog.GetMutableTableByID(ctx, op.TableID)
 	if err != nil {
 		return err
 	}
+
 	// TODO(ajwerner): deal with ordering the indexes or sanity checking this
 	// or what-not.
 	if op.Column.ID >= table.NextColumnID {
 		table.NextColumnID = op.Column.ID + 1
 	}
-	if !op.Column.IsComputed() ||
-		!op.Column.Virtual {
-		var foundFamily bool
-		for i := range table.Families {
-			fam := &table.Families[i]
-			if foundFamily = fam.ID == op.FamilyID; foundFamily {
-				fam.ColumnIDs = append(fam.ColumnIDs, op.Column.ID)
-				fam.ColumnNames = append(fam.ColumnNames, op.Column.Name)
-				break
-			}
+	var foundFamily bool
+	for i := range table.Families {
+		fam := &table.Families[i]
+		if foundFamily = fam.ID == op.FamilyID; foundFamily {
+			fam.ColumnIDs = append(fam.ColumnIDs, op.Column.ID)
+			fam.ColumnNames = append(fam.ColumnNames, op.Column.Name)
+			break
 		}
-		// Only create column families for non-computed columns
-		if !foundFamily {
-			table.Families = append(table.Families, descpb.ColumnFamilyDescriptor{
-				Name:        op.FamilyName,
-				ID:          op.FamilyID,
-				ColumnNames: []string{op.Column.Name},
-				ColumnIDs:   []descpb.ColumnID{op.Column.ID},
-			})
-			sort.Slice(table.Families, func(i, j int) bool {
-				return table.Families[i].ID < table.Families[j].ID
-			})
-			if table.NextFamilyID <= op.FamilyID {
-				table.NextFamilyID = op.FamilyID + 1
-			}
+	}
+	if !foundFamily {
+		table.Families = append(table.Families, descpb.ColumnFamilyDescriptor{
+			Name:        op.FamilyName,
+			ID:          op.FamilyID,
+			ColumnNames: []string{op.Column.Name},
+			ColumnIDs:   []descpb.ColumnID{op.Column.ID},
+		})
+		sort.Slice(table.Families, func(i, j int) bool {
+			return table.Families[i].ID < table.Families[j].ID
+		})
+		if table.NextFamilyID <= op.FamilyID {
+			table.NextFamilyID = op.FamilyID + 1
 		}
 	}
 	table.AddColumnMutation(&op.Column, descpb.DescriptorMutation_ADD)
@@ -491,7 +409,7 @@ func (m *visitor) MakeAddedColumnDeleteOnly(
 func (m *visitor) MakeDroppedIndexDeleteOnly(
 	ctx context.Context, op scop.MakeDroppedIndexDeleteOnly,
 ) error {
-	table, err := m.checkOutTable(ctx, op.TableID)
+	table, err := m.catalog.GetMutableTableByID(ctx, op.TableID)
 	if err != nil {
 		return err
 	}
@@ -507,82 +425,43 @@ func (m *visitor) MakeDroppedIndexDeleteOnly(
 func (m *visitor) MakeDroppedPrimaryIndexDeleteAndWriteOnly(
 	ctx context.Context, op scop.MakeDroppedPrimaryIndexDeleteAndWriteOnly,
 ) error {
-	table, err := m.checkOutTable(ctx, op.TableID)
+	table, err := m.catalog.GetMutableTableByID(ctx, op.TableID)
 	if err != nil {
 		return err
 	}
-	if table.PrimaryIndex.ID != op.IndexID {
-		return errors.AssertionFailedf("index being dropped (%d) does not match existing primary index (%d).", op.IndexID, table.PrimaryIndex.ID)
+
+	// NOTE: There is no ordering guarantee between operations which might
+	// touch the primary index. Remove it if it has not already been overwritten.
+	if table.PrimaryIndex.ID == op.Index.ID {
+		table.PrimaryIndex = descpb.IndexDescriptor{}
 	}
-	idx := protoutil.Clone(&table.PrimaryIndex).(*descpb.IndexDescriptor)
+
+	idx := protoutil.Clone(&op.Index).(*descpb.IndexDescriptor)
 	return table.AddIndexMutation(idx, descpb.DescriptorMutation_DROP)
 }
 
 func (m *visitor) MakeAddedIndexDeleteOnly(
 	ctx context.Context, op scop.MakeAddedIndexDeleteOnly,
 ) error {
-	table, err := m.checkOutTable(ctx, op.TableID)
+
+	table, err := m.catalog.GetMutableTableByID(ctx, op.TableID)
 	if err != nil {
 		return err
 	}
+
 	// TODO(ajwerner): deal with ordering the indexes or sanity checking this
 	// or what-not.
-	if op.IndexID >= table.NextIndexID {
-		table.NextIndexID = op.IndexID + 1
+	if op.Index.ID >= table.NextIndexID {
+		table.NextIndexID = op.Index.ID + 1
 	}
-	// Resolve column names
-	colNames, err := columnNamesFromIDs(table, op.KeyColumnIDs)
-	if err != nil {
-		return err
-	}
-	storeColNames, err := columnNamesFromIDs(table, op.StoreColumnIDs)
-	if err != nil {
-		return err
-	}
-	// Setup the index descriptor type.
-	indexType := descpb.IndexDescriptor_FORWARD
-	if op.Inverted {
-		indexType = descpb.IndexDescriptor_INVERTED
-	}
-	// Setup the encoding type.
-	encodingType := descpb.PrimaryIndexEncoding
-	indexVersion := descpb.PrimaryIndexWithStoredColumnsVersion
-	if op.SecondaryIndex {
-		encodingType = descpb.SecondaryIndexEncoding
-		indexVersion = descpb.StrictIndexColumnIDGuaranteesVersion
-	}
-	// Create an index descriptor from the the operation.
-	idx := &descpb.IndexDescriptor{
-		Name:                op.IndexName,
-		ID:                  op.IndexID,
-		Unique:              op.Unique,
-		Version:             indexVersion,
-		KeyColumnNames:      colNames,
-		KeyColumnIDs:        op.KeyColumnIDs,
-		StoreColumnIDs:      op.StoreColumnIDs,
-		StoreColumnNames:    storeColNames,
-		KeyColumnDirections: op.KeyColumnDirections,
-		Type:                indexType,
-		KeySuffixColumnIDs:  op.KeySuffixColumnIDs,
-		CompositeColumnIDs:  op.CompositeColumnIDs,
-		CreatedExplicitly:   true,
-		EncodingType:        encodingType,
-	}
-	if idx.Name == "" {
-		name, err := tabledesc.BuildIndexName(table, idx)
-		if err != nil {
-			return err
-		}
-		idx.Name = name
-	}
-	if op.ShardedDescriptor != nil {
-		idx.Sharded = *op.ShardedDescriptor
-	}
+	// Make some adjustments to the index descriptor so that it behaves correctly
+	// as a secondary index while being added.
+	idx := protoutil.Clone(&op.Index).(*descpb.IndexDescriptor)
 	return table.AddIndexMutation(idx, descpb.DescriptorMutation_ADD)
 }
 
 func (m *visitor) AddCheckConstraint(ctx context.Context, op scop.AddCheckConstraint) error {
-	table, err := m.checkOutTable(ctx, op.TableID)
+	table, err := m.catalog.GetMutableTableByID(ctx, op.TableID)
 	if err != nil {
 		return err
 	}
@@ -601,54 +480,27 @@ func (m *visitor) AddCheckConstraint(ctx context.Context, op scop.AddCheckConstr
 	return nil
 }
 
-func (m *visitor) MakeAddedSecondaryIndexPublic(
-	ctx context.Context, op scop.MakeAddedSecondaryIndexPublic,
-) error {
-	table, err := m.checkOutTable(ctx, op.TableID)
-	if err != nil {
-		return err
-	}
-
-	for idx, idxMutation := range table.GetMutations() {
-		if idxMutation.GetIndex() != nil &&
-			idxMutation.GetIndex().ID == op.IndexID {
-			err := table.MakeMutationComplete(idxMutation)
-			if err != nil {
-				return err
-			}
-			table.Mutations = append(table.Mutations[:idx], table.Mutations[idx+1:]...)
-			break
-		}
-	}
-	return nil
-}
-
 func (m *visitor) MakeAddedPrimaryIndexPublic(
 	ctx context.Context, op scop.MakeAddedPrimaryIndexPublic,
 ) error {
-	table, err := m.checkOutTable(ctx, op.TableID)
+	table, err := m.catalog.GetMutableTableByID(ctx, op.TableID)
 	if err != nil {
 		return err
 	}
-	index, err := table.FindIndexWithID(op.IndexID)
-	if err != nil {
-		return err
-	}
-	indexDesc := index.IndexDescDeepCopy()
 	if _, err := removeMutation(
 		ctx,
 		table,
-		descriptorutils.MakeIndexIDMutationSelector(op.IndexID),
+		descriptorutils.MakeIndexIDMutationSelector(op.Index.ID),
 		descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY,
 	); err != nil {
 		return err
 	}
-	table.PrimaryIndex = indexDesc
+	table.PrimaryIndex = *(protoutil.Clone(&op.Index)).(*descpb.IndexDescriptor)
 	return nil
 }
 
 func (m *visitor) MakeIndexAbsent(ctx context.Context, op scop.MakeIndexAbsent) error {
-	table, err := m.checkOutTable(ctx, op.TableID)
+	table, err := m.catalog.GetMutableTableByID(ctx, op.TableID)
 	if err != nil {
 		return err
 	}
@@ -661,7 +513,7 @@ func (m *visitor) MakeIndexAbsent(ctx context.Context, op scop.MakeIndexAbsent) 
 }
 
 func (m *visitor) AddColumnFamily(ctx context.Context, op scop.AddColumnFamily) error {
-	table, err := m.checkOutTable(ctx, op.TableID)
+	table, err := m.catalog.GetMutableTableByID(ctx, op.TableID)
 	if err != nil {
 		return err
 	}
@@ -673,7 +525,7 @@ func (m *visitor) AddColumnFamily(ctx context.Context, op scop.AddColumnFamily) 
 }
 
 func (m *visitor) DropForeignKeyRef(ctx context.Context, op scop.DropForeignKeyRef) error {
-	table, err := m.checkOutTable(ctx, op.TableID)
+	table, err := m.catalog.GetMutableTableByID(ctx, op.TableID)
 	if err != nil {
 		return err
 	}
@@ -697,18 +549,6 @@ func (m *visitor) DropForeignKeyRef(ctx context.Context, op scop.DropForeignKeyR
 		table.TableDesc().InboundFKs = newFks
 	}
 	return nil
-}
-
-func (m *visitor) AddIndexPartitionInfo(ctx context.Context, op scop.AddIndexPartitionInfo) error {
-	table, err := m.checkOutTable(ctx, op.TableID)
-	if err != nil {
-		return err
-	}
-	index, err := table.FindIndexWithID(op.IndexID)
-	if err != nil {
-		return err
-	}
-	return m.cr.AddPartitioning(table, index.IndexDesc(), op.PartitionFields, op.ListPartitions, op.RangePartitions, nil, true)
 }
 
 var _ scop.MutationVisitor = (*visitor)(nil)

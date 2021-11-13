@@ -181,13 +181,11 @@ type ReplicationHelper struct {
 
 // NewReplicationHelper starts test server and configures it to have active
 // tenant.
-func NewReplicationHelper(
-	t *testing.T, serverArgs base.TestServerArgs,
-) (*ReplicationHelper, func()) {
+func NewReplicationHelper(t *testing.T) (*ReplicationHelper, func()) {
 	ctx := context.Background()
 
 	// Start server
-	s, db, _ := serverutils.StartServer(t, serverArgs)
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 
 	// Make changefeeds run faster.
 	resetFreq := changefeedbase.TestingSetDefaultFlushFrequency(50 * time.Millisecond)

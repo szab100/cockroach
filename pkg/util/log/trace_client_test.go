@@ -31,12 +31,13 @@ func TestTrace(t *testing.T) {
 			name: "verbose",
 			init: func(ctx context.Context) (context.Context, *tracing.Span) {
 				tracer := tracing.NewTracer()
-				sp := tracer.StartSpan("s", tracing.WithRecording(tracing.RecordingVerbose))
+				sp := tracer.StartSpan("s", tracing.WithForceRealSpan())
+				sp.SetVerbose(true)
 				ctxWithSpan := tracing.ContextWithSpan(ctx, sp)
 				return ctxWithSpan, sp
 			},
 			check: func(t *testing.T, _ context.Context, sp *tracing.Span) {
-				if err := tracing.CheckRecordedSpans(sp.GetRecording(tracing.RecordingVerbose), `
+				if err := tracing.TestingCheckRecordedSpans(sp.GetRecording(), `
 		span: s
 			tags: _verbose=1
 			event: test1
@@ -94,8 +95,9 @@ func TestTraceWithTags(t *testing.T) {
 	ctx = logtags.AddTag(ctx, "tag", 1)
 
 	tracer := tracing.NewTracer()
-	sp := tracer.StartSpan("s", tracing.WithRecording(tracing.RecordingVerbose))
+	sp := tracer.StartSpan("s", tracing.WithForceRealSpan())
 	ctxWithSpan := tracing.ContextWithSpan(ctx, sp)
+	sp.SetVerbose(true)
 
 	log.Event(ctxWithSpan, "test1")
 	log.VEvent(ctxWithSpan, log.NoLogV(), "test2")
@@ -103,7 +105,7 @@ func TestTraceWithTags(t *testing.T) {
 	log.Info(ctxWithSpan, "log")
 
 	sp.Finish()
-	if err := tracing.CheckRecordedSpans(sp.GetRecording(tracing.RecordingVerbose), `
+	if err := tracing.TestingCheckRecordedSpans(sp.GetRecording(), `
 		span: s
 			tags: _verbose=1
 			event: [tag=1] test1

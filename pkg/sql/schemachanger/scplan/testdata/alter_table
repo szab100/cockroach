@@ -18,47 +18,81 @@ Stage 0
     FamilyName: primary
     TableID: 52
   *scop.MakeAddedIndexDeleteOnly
-    IndexID: 2
-    IndexName: new_primary_key
-    KeyColumnDirections:
-    - 0
-    KeyColumnIDs:
-    - 1
-    ShardedDescriptor: {}
-    StoreColumnIDs:
-    - 2
+    Index:
+      EncodingType: 1
+      ID: 2
+      KeyColumnDirections:
+      - 0
+      KeyColumnIDs:
+      - 1
+      KeyColumnNames:
+      - i
+      Name: new_primary_key
+      StoreColumnIDs:
+      - 2
+      StoreColumnNames:
+      - j
+      Unique: true
+      Version: 4
     TableID: 52
-    Unique: true
 Stage 1
   *scop.MakeAddedIndexDeleteAndWriteOnly
     IndexID: 2
     TableID: 52
+Stage 2
   *scop.MakeAddedColumnDeleteAndWriteOnly
     ColumnID: 2
     TableID: 52
-Stage 2
+Stage 3
   *scop.BackfillIndex
     IndexID: 2
     TableID: 52
-Stage 3
+Stage 4
   *scop.ValidateUniqueIndex
     IndexID: 2
+    PrimaryIndexID: 1
     TableID: 52
-Stage 4
-  *scop.MakeDroppedPrimaryIndexDeleteAndWriteOnly
-    IndexID: 1
-    TableID: 52
-  *scop.MakeAddedPrimaryIndexPublic
-    IndexID: 2
-    TableID: 52
+Stage 5
   *scop.MakeColumnPublic
     ColumnID: 2
     TableID: 52
-Stage 5 (non-revertible)
+  *scop.MakeAddedPrimaryIndexPublic
+    Index:
+      EncodingType: 1
+      ID: 2
+      KeyColumnDirections:
+      - 0
+      KeyColumnIDs:
+      - 1
+      KeyColumnNames:
+      - i
+      Name: new_primary_key
+      StoreColumnIDs:
+      - 2
+      StoreColumnNames:
+      - j
+      Unique: true
+      Version: 4
+    TableID: 52
+  *scop.MakeDroppedPrimaryIndexDeleteAndWriteOnly
+    Index:
+      EncodingType: 1
+      ID: 1
+      KeyColumnDirections:
+      - 0
+      KeyColumnIDs:
+      - 1
+      KeyColumnNames:
+      - i
+      Name: primary
+      Unique: true
+      Version: 4
+    TableID: 52
+Stage 6
   *scop.MakeDroppedIndexDeleteOnly
     IndexID: 1
     TableID: 52
-Stage 6 (non-revertible)
+Stage 7
   *scop.MakeIndexAbsent
     IndexID: 1
     TableID: 52
@@ -80,47 +114,81 @@ Stage 0
     FamilyName: primary
     TableID: 52
   *scop.MakeAddedIndexDeleteOnly
-    IndexID: 2
-    IndexName: new_primary_key
-    KeyColumnDirections:
-    - 0
-    KeyColumnIDs:
-    - 1
-    ShardedDescriptor: {}
-    StoreColumnIDs:
-    - 2
+    Index:
+      EncodingType: 1
+      ID: 2
+      KeyColumnDirections:
+      - 0
+      KeyColumnIDs:
+      - 1
+      KeyColumnNames:
+      - i
+      Name: new_primary_key
+      StoreColumnIDs:
+      - 2
+      StoreColumnNames:
+      - j
+      Unique: true
+      Version: 4
     TableID: 52
-    Unique: true
 Stage 1
   *scop.MakeAddedIndexDeleteAndWriteOnly
     IndexID: 2
     TableID: 52
+Stage 2
   *scop.MakeAddedColumnDeleteAndWriteOnly
     ColumnID: 2
     TableID: 52
-Stage 2
+Stage 3
   *scop.BackfillIndex
     IndexID: 2
     TableID: 52
-Stage 3
+Stage 4
   *scop.ValidateUniqueIndex
     IndexID: 2
+    PrimaryIndexID: 1
     TableID: 52
-Stage 4
-  *scop.MakeDroppedPrimaryIndexDeleteAndWriteOnly
-    IndexID: 1
-    TableID: 52
-  *scop.MakeAddedPrimaryIndexPublic
-    IndexID: 2
-    TableID: 52
+Stage 5
   *scop.MakeColumnPublic
     ColumnID: 2
     TableID: 52
-Stage 5 (non-revertible)
+  *scop.MakeAddedPrimaryIndexPublic
+    Index:
+      EncodingType: 1
+      ID: 2
+      KeyColumnDirections:
+      - 0
+      KeyColumnIDs:
+      - 1
+      KeyColumnNames:
+      - i
+      Name: new_primary_key
+      StoreColumnIDs:
+      - 2
+      StoreColumnNames:
+      - j
+      Unique: true
+      Version: 4
+    TableID: 52
+  *scop.MakeDroppedPrimaryIndexDeleteAndWriteOnly
+    Index:
+      EncodingType: 1
+      ID: 1
+      KeyColumnDirections:
+      - 0
+      KeyColumnIDs:
+      - 1
+      KeyColumnNames:
+      - i
+      Name: primary
+      Unique: true
+      Version: 4
+    TableID: 52
+Stage 6
   *scop.MakeDroppedIndexDeleteOnly
     IndexID: 1
     TableID: 52
-Stage 6 (non-revertible)
+Stage 7
   *scop.MakeIndexAbsent
     IndexID: 1
     TableID: 52
@@ -142,6 +210,26 @@ Stage 0
         width: 64
     FamilyName: primary
     TableID: 52
+  *scop.MakeAddedIndexDeleteOnly
+    Index:
+      EncodingType: 1
+      ID: 2
+      KeyColumnDirections:
+      - 0
+      KeyColumnIDs:
+      - 1
+      KeyColumnNames:
+      - i
+      Name: new_primary_key
+      StoreColumnIDs:
+      - 2
+      - 3
+      StoreColumnNames:
+      - j
+      - k
+      Unique: true
+      Version: 4
+    TableID: 52
   *scop.MakeAddedColumnDeleteOnly
     Column:
       DefaultExpr: 456:::INT8
@@ -154,55 +242,72 @@ Stage 0
         width: 64
     FamilyName: primary
     TableID: 52
-  *scop.MakeAddedIndexDeleteOnly
-    IndexID: 2
-    IndexName: new_primary_key
-    KeyColumnDirections:
-    - 0
-    KeyColumnIDs:
-    - 1
-    ShardedDescriptor: {}
-    StoreColumnIDs:
-    - 2
-    - 3
-    TableID: 52
-    Unique: true
 Stage 1
   *scop.MakeAddedIndexDeleteAndWriteOnly
     IndexID: 2
     TableID: 52
+Stage 2
   *scop.MakeAddedColumnDeleteAndWriteOnly
     ColumnID: 2
     TableID: 52
   *scop.MakeAddedColumnDeleteAndWriteOnly
     ColumnID: 3
     TableID: 52
-Stage 2
+Stage 3
   *scop.BackfillIndex
     IndexID: 2
     TableID: 52
-Stage 3
+Stage 4
   *scop.ValidateUniqueIndex
     IndexID: 2
+    PrimaryIndexID: 1
     TableID: 52
-Stage 4
-  *scop.MakeDroppedPrimaryIndexDeleteAndWriteOnly
-    IndexID: 1
-    TableID: 52
-  *scop.MakeAddedPrimaryIndexPublic
-    IndexID: 2
-    TableID: 52
+Stage 5
   *scop.MakeColumnPublic
     ColumnID: 2
+    TableID: 52
+  *scop.MakeAddedPrimaryIndexPublic
+    Index:
+      EncodingType: 1
+      ID: 2
+      KeyColumnDirections:
+      - 0
+      KeyColumnIDs:
+      - 1
+      KeyColumnNames:
+      - i
+      Name: new_primary_key
+      StoreColumnIDs:
+      - 2
+      - 3
+      StoreColumnNames:
+      - j
+      - k
+      Unique: true
+      Version: 4
+    TableID: 52
+  *scop.MakeDroppedPrimaryIndexDeleteAndWriteOnly
+    Index:
+      EncodingType: 1
+      ID: 1
+      KeyColumnDirections:
+      - 0
+      KeyColumnIDs:
+      - 1
+      KeyColumnNames:
+      - i
+      Name: primary
+      Unique: true
+      Version: 4
     TableID: 52
   *scop.MakeColumnPublic
     ColumnID: 3
     TableID: 52
-Stage 5 (non-revertible)
+Stage 6
   *scop.MakeDroppedIndexDeleteOnly
     IndexID: 1
     TableID: 52
-Stage 6 (non-revertible)
+Stage 7
   *scop.MakeIndexAbsent
     IndexID: 1
     TableID: 52
@@ -224,47 +329,81 @@ Stage 0
     FamilyName: primary
     TableID: 52
   *scop.MakeAddedIndexDeleteOnly
-    IndexID: 2
-    IndexName: new_primary_key
-    KeyColumnDirections:
-    - 0
-    KeyColumnIDs:
-    - 1
-    ShardedDescriptor: {}
-    StoreColumnIDs:
-    - 2
+    Index:
+      EncodingType: 1
+      ID: 2
+      KeyColumnDirections:
+      - 0
+      KeyColumnIDs:
+      - 1
+      KeyColumnNames:
+      - i
+      Name: new_primary_key
+      StoreColumnIDs:
+      - 2
+      StoreColumnNames:
+      - a
+      Unique: true
+      Version: 4
     TableID: 52
-    Unique: true
 Stage 1
   *scop.MakeAddedIndexDeleteAndWriteOnly
     IndexID: 2
     TableID: 52
+Stage 2
   *scop.MakeAddedColumnDeleteAndWriteOnly
     ColumnID: 2
     TableID: 52
-Stage 2
+Stage 3
   *scop.BackfillIndex
     IndexID: 2
     TableID: 52
-Stage 3
+Stage 4
   *scop.ValidateUniqueIndex
     IndexID: 2
+    PrimaryIndexID: 1
     TableID: 52
-Stage 4
-  *scop.MakeDroppedPrimaryIndexDeleteAndWriteOnly
-    IndexID: 1
-    TableID: 52
-  *scop.MakeAddedPrimaryIndexPublic
-    IndexID: 2
-    TableID: 52
+Stage 5
   *scop.MakeColumnPublic
     ColumnID: 2
     TableID: 52
-Stage 5 (non-revertible)
+  *scop.MakeAddedPrimaryIndexPublic
+    Index:
+      EncodingType: 1
+      ID: 2
+      KeyColumnDirections:
+      - 0
+      KeyColumnIDs:
+      - 1
+      KeyColumnNames:
+      - i
+      Name: new_primary_key
+      StoreColumnIDs:
+      - 2
+      StoreColumnNames:
+      - a
+      Unique: true
+      Version: 4
+    TableID: 52
+  *scop.MakeDroppedPrimaryIndexDeleteAndWriteOnly
+    Index:
+      EncodingType: 1
+      ID: 1
+      KeyColumnDirections:
+      - 0
+      KeyColumnIDs:
+      - 1
+      KeyColumnNames:
+      - i
+      Name: primary
+      Unique: true
+      Version: 4
+    TableID: 52
+Stage 6
   *scop.MakeDroppedIndexDeleteOnly
     IndexID: 1
     TableID: 52
-Stage 6 (non-revertible)
+Stage 7
   *scop.MakeIndexAbsent
     IndexID: 1
     TableID: 52
@@ -291,17 +430,23 @@ Stage 0
     FamilyName: primary
     TableID: 52
   *scop.MakeAddedIndexDeleteOnly
-    IndexID: 2
-    IndexName: new_primary_key
-    KeyColumnDirections:
-    - 0
-    KeyColumnIDs:
-    - 1
-    ShardedDescriptor: {}
-    StoreColumnIDs:
-    - 2
+    Index:
+      EncodingType: 1
+      ID: 2
+      KeyColumnDirections:
+      - 0
+      KeyColumnIDs:
+      - 1
+      KeyColumnNames:
+      - i
+      Name: new_primary_key
+      StoreColumnIDs:
+      - 2
+      StoreColumnNames:
+      - a
+      Unique: true
+      Version: 4
     TableID: 52
-    Unique: true
   *scop.MakeAddedColumnDeleteOnly
     Column:
       ID: 3
@@ -314,72 +459,140 @@ Stage 0
     FamilyName: primary
     TableID: 53
   *scop.MakeAddedIndexDeleteOnly
-    IndexID: 2
-    IndexName: new_primary_key
-    KeyColumnDirections:
-    - 0
-    KeyColumnIDs:
-    - 2
-    ShardedDescriptor: {}
-    StoreColumnIDs:
-    - 1
-    - 3
+    Index:
+      EncodingType: 1
+      ID: 2
+      KeyColumnDirections:
+      - 0
+      KeyColumnIDs:
+      - 2
+      KeyColumnNames:
+      - rowid
+      Name: new_primary_key
+      StoreColumnIDs:
+      - 1
+      - 3
+      StoreColumnNames:
+      - j
+      - b
+      Unique: true
+      Version: 4
     TableID: 53
-    Unique: true
 Stage 1
   *scop.MakeAddedIndexDeleteAndWriteOnly
     IndexID: 2
     TableID: 52
-  *scop.MakeAddedColumnDeleteAndWriteOnly
-    ColumnID: 2
-    TableID: 52
   *scop.MakeAddedIndexDeleteAndWriteOnly
     IndexID: 2
     TableID: 53
+Stage 2
+  *scop.MakeAddedColumnDeleteAndWriteOnly
+    ColumnID: 2
+    TableID: 52
   *scop.MakeAddedColumnDeleteAndWriteOnly
     ColumnID: 3
     TableID: 53
-Stage 2
-  *scop.BackfillIndex
-    IndexID: 2
-    TableID: 52
-  *scop.BackfillIndex
-    IndexID: 2
-    TableID: 53
 Stage 3
-  *scop.ValidateUniqueIndex
+  *scop.BackfillIndex
     IndexID: 2
     TableID: 52
-  *scop.ValidateUniqueIndex
+  *scop.BackfillIndex
     IndexID: 2
     TableID: 53
 Stage 4
-  *scop.MakeDroppedPrimaryIndexDeleteAndWriteOnly
-    IndexID: 1
-    TableID: 52
-  *scop.MakeAddedPrimaryIndexPublic
+  *scop.ValidateUniqueIndex
     IndexID: 2
+    PrimaryIndexID: 1
     TableID: 52
+  *scop.ValidateUniqueIndex
+    IndexID: 2
+    PrimaryIndexID: 1
+    TableID: 53
+Stage 5
   *scop.MakeColumnPublic
     ColumnID: 2
     TableID: 52
-  *scop.MakeDroppedPrimaryIndexDeleteAndWriteOnly
-    IndexID: 1
-    TableID: 53
   *scop.MakeAddedPrimaryIndexPublic
-    IndexID: 2
-    TableID: 53
+    Index:
+      EncodingType: 1
+      ID: 2
+      KeyColumnDirections:
+      - 0
+      KeyColumnIDs:
+      - 1
+      KeyColumnNames:
+      - i
+      Name: new_primary_key
+      StoreColumnIDs:
+      - 2
+      StoreColumnNames:
+      - a
+      Unique: true
+      Version: 4
+    TableID: 52
+  *scop.MakeDroppedPrimaryIndexDeleteAndWriteOnly
+    Index:
+      EncodingType: 1
+      ID: 1
+      KeyColumnDirections:
+      - 0
+      KeyColumnIDs:
+      - 1
+      KeyColumnNames:
+      - i
+      Name: primary
+      Unique: true
+      Version: 4
+    TableID: 52
   *scop.MakeColumnPublic
     ColumnID: 3
     TableID: 53
-Stage 5 (non-revertible)
+  *scop.MakeAddedPrimaryIndexPublic
+    Index:
+      EncodingType: 1
+      ID: 2
+      KeyColumnDirections:
+      - 0
+      KeyColumnIDs:
+      - 2
+      KeyColumnNames:
+      - rowid
+      Name: new_primary_key
+      StoreColumnIDs:
+      - 1
+      - 3
+      StoreColumnNames:
+      - j
+      - b
+      Unique: true
+      Version: 4
+    TableID: 53
+  *scop.MakeDroppedPrimaryIndexDeleteAndWriteOnly
+    Index:
+      EncodingType: 1
+      ID: 1
+      KeyColumnDirections:
+      - 0
+      KeyColumnIDs:
+      - 2
+      KeyColumnNames:
+      - rowid
+      Name: primary
+      StoreColumnIDs:
+      - 1
+      StoreColumnNames:
+      - j
+      Unique: true
+      Version: 4
+    TableID: 53
+Stage 6
   *scop.MakeDroppedIndexDeleteOnly
     IndexID: 1
     TableID: 52
   *scop.MakeDroppedIndexDeleteOnly
     IndexID: 1
     TableID: 53
-Stage 6 (non-revertible)
+Stage 7
   *scop.MakeIndexAbsent
     IndexID: 1
     TableID: 52
