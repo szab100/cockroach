@@ -65,7 +65,6 @@ import { UIConfigState } from "../store";
 import { StatementsRequest } from "src/api/statementsApi";
 import Long from "long";
 import ClearStats from "../sqlActivity/clearStats";
-import SQLActivityError from "../sqlActivity/errorComponent";
 import { commonStyles } from "../common";
 
 const cx = classNames.bind(styles);
@@ -581,11 +580,6 @@ export class StatementsPage extends React.Component<
           loading={isNil(this.props.statements)}
           error={this.props.statementsError}
           render={this.renderStatements}
-          renderError={() =>
-            SQLActivityError({
-              statsType: "statements",
-            })
-          }
         />
         <ActivateStatementDiagnosticsModal
           ref={this.activateDiagnosticsRef}

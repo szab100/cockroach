@@ -207,7 +207,7 @@ func StartTenant(
 
 	if err := args.stopper.RunAsyncTask(ctx, "serve-http", func(ctx context.Context) {
 		mux := http.NewServeMux()
-		debugServer := debug.NewServer(args.Settings, s.pgServer.HBADebugFn(), s.execCfg.SQLStatusServer)
+		debugServer := debug.NewServer(args.Settings, s.pgServer.HBADebugFn())
 		mux.Handle("/", debugServer)
 		mux.Handle("/_status/", gwMux)
 		mux.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
@@ -270,16 +270,14 @@ func StartTenant(
 	// The InstanceID subsystem is not available until `preStart`.
 	args.rpcContext.NodeID.Set(ctx, roachpb.NodeID(s.SQLInstanceID()))
 
-	if knobs, ok := baseCfg.TestingKnobs.TenantTestingKnobs.(*sql.TenantTestingKnobs); !ok || !knobs.DisableLogTags {
-		// Register the server's identifiers so that log events are
-		// decorated with the server's identity. This helps when gathering
-		// log events from multiple servers into the same log collector.
-		//
-		// We do this only here, as the identifiers may not be known before this point.
-		clusterID := args.rpcContext.ClusterID.Get().String()
-		log.SetNodeIDs(clusterID, 0 /* nodeID is not known for a SQL-only server. */)
-		log.SetTenantIDs(args.TenantID.String(), int32(s.SQLInstanceID()))
-	}
+	// Register the server's identifiers so that log events are
+	// decorated with the server's identity. This helps when gathering
+	// log events from multiple servers into the same log collector.
+	//
+	// We do this only here, as the identifiers may not be known before this point.
+	clusterID := args.rpcContext.ClusterID.Get().String()
+	log.SetNodeIDs(clusterID, 0 /* nodeID is not known for a SQL-only server. */)
+	log.SetTenantIDs(args.TenantID.String(), int32(s.SQLInstanceID()))
 
 	externalUsageFn := func(ctx context.Context) multitenant.ExternalUsage {
 		userTimeMillis, _, err := status.GetCPUTime(ctx)
@@ -324,11 +322,9 @@ func loadVarsHandler(
 ) func(http.ResponseWriter, *http.Request) {
 	cpuUserNanos := metric.NewGauge(rsr.CPUUserNS.GetMetadata())
 	cpuSysNanos := metric.NewGauge(rsr.CPUSysNS.GetMetadata())
-	cpuNowNanos := metric.NewGauge(rsr.CPUNowNS.GetMetadata())
 	registry := metric.NewRegistry()
 	registry.AddMetric(cpuUserNanos)
 	registry.AddMetric(cpuSysNanos)
-	registry.AddMetric(cpuNowNanos)
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		userTimeMillis, sysTimeMillis, err := status.GetCPUTime(ctx)
@@ -336,13 +332,11 @@ func loadVarsHandler(
 			// Just log but don't return an error to match the _status/vars metrics handler.
 			log.Ops.Errorf(ctx, "unable to get cpu usage: %v", err)
 		}
-
 		// cpuTime.{User,Sys} are in milliseconds, convert to nanoseconds.
 		utime := userTimeMillis * 1e6
 		stime := sysTimeMillis * 1e6
 		cpuUserNanos.Update(utime)
 		cpuSysNanos.Update(stime)
-		cpuNowNanos.Update(timeutil.Now().UnixNano())
 
 		exporter := metric.MakePrometheusExporter()
 		exporter.ScrapeRegistry(registry, true)

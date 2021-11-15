@@ -233,6 +233,8 @@ func TestIndexInterface(t *testing.T) {
 
 	// Check index methods on features not tested here.
 	for _, idx := range indexes {
+		require.False(t, idx.IsInterleaved(),
+			errMsgFmt, "IsInterleaved", idx.GetName())
 		require.False(t, idx.IsDisabled(),
 			errMsgFmt, "IsDisabled", idx.GetName())
 		require.False(t, idx.IsCreatedExplicitly(),
@@ -244,6 +246,10 @@ func TestIndexInterface(t *testing.T) {
 			require.Equal(t, descpb.IndexDescriptorVersion(0x3), idx.GetVersion(),
 				errMsgFmt, "GetVersion", idx.GetName())
 		}
+		require.Equal(t, 0, idx.NumInterleaveAncestors(),
+			errMsgFmt, "NumInterleaveAncestors", idx.GetName())
+		require.Equal(t, 0, idx.NumInterleavedBy(),
+			errMsgFmt, "NumInterleavedBy", idx.GetName())
 		require.False(t, idx.HasOldStoredColumns(),
 			errMsgFmt, "HasOldStoredColumns", idx.GetName())
 		require.Equalf(t, 0, idx.NumCompositeColumns(),

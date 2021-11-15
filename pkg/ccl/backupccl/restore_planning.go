@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -319,16 +320,21 @@ func allocateDescriptorRewrites(
 	descriptorCoverage tree.DescriptorCoverage,
 	opts tree.RestoreOptions,
 	intoDB string,
-	newDBName string,
 ) (DescRewriteMap, error) {
 	descriptorRewrites := make(DescRewriteMap)
+	var overrideDB string
+	var renaming bool
+	if opts.IntoDB != nil {
+		overrideDB = intoDB
+		renaming = true
+	}
 
 	restoreDBNames := make(map[string]catalog.DatabaseDescriptor, len(restoreDBs))
 	for _, db := range restoreDBs {
 		restoreDBNames[db.GetName()] = db
 	}
 
-	if len(restoreDBNames) > 0 && intoDB != "" {
+	if len(restoreDBNames) > 0 && renaming {
 		return nil, errors.Errorf("cannot use %q option when restoring database(s)", restoreOptIntoDB)
 	}
 
@@ -555,7 +561,8 @@ func allocateDescriptorRewrites(
 				continue
 			}
 
-			targetDB, err := resolveTargetDB(ctx, txn, p, databasesByID, intoDB, descriptorCoverage, sc)
+			targetDB, err := resolveTargetDB(ctx, txn, p, databasesByID, renaming, overrideDB,
+				descriptorCoverage, sc)
 			if err != nil {
 				return err
 			}
@@ -612,8 +619,8 @@ func allocateDescriptorRewrites(
 				continue
 			}
 
-			targetDB, err := resolveTargetDB(ctx, txn, p, databasesByID, intoDB, descriptorCoverage,
-				table)
+			targetDB, err := resolveTargetDB(ctx, txn, p, databasesByID, renaming, overrideDB,
+				descriptorCoverage, table)
 			if err != nil {
 				return err
 			}
@@ -657,11 +664,13 @@ func allocateDescriptorRewrites(
 					return err
 				}
 
-				// We're restoring a table and not its parent database. We may block
-				// restoring multi-region tables to multi-region databases since
-				// regions may mismatch.
-				if err := checkMultiRegionCompatible(ctx, txn, p.ExecCfg().Codec, table, parentDB); err != nil {
-					return pgerror.WithCandidateCode(err, pgcode.FeatureNotSupported)
+				if parentDB.IsMultiRegion() && table.GetLocalityConfig() != nil {
+					// We're restoring a table and not its parent database. We may block
+					// restoring multi-region tables to multi-region databases since
+					// regions may mismatch.
+					if err := checkMultiRegionCompatible(ctx, txn, p.ExecCfg().Codec, table, parentDB); err != nil {
+						return pgerror.WithCandidateCode(err, pgcode.FeatureNotSupported)
+					}
 				}
 
 				// Create the table rewrite with the new parent ID. We've done all the
@@ -677,7 +686,8 @@ func allocateDescriptorRewrites(
 				continue
 			}
 
-			targetDB, err := resolveTargetDB(ctx, txn, p, databasesByID, intoDB, descriptorCoverage, typ)
+			targetDB, err := resolveTargetDB(ctx, txn, p, databasesByID, renaming, overrideDB,
+				descriptorCoverage, typ)
 			if err != nil {
 				return err
 			}
@@ -708,20 +718,12 @@ func allocateDescriptorRewrites(
 				}
 
 				// See if there is an existing type with the same name.
-				getParentSchemaID := func(typ *typedesc.Mutable) (parentSchemaID descpb.ID) {
-					parentSchemaID = typ.GetParentSchemaID()
-					// If we find UDS with same name defined in the restoring DB, use its ID instead.
-					if rewrite, ok := descriptorRewrites[parentSchemaID]; ok && rewrite.ID != 0 {
-						parentSchemaID = rewrite.ID
-					}
-					return
-				}
 				desc, err := catalogkv.GetDescriptorCollidingWithObject(
 					ctx,
 					txn,
 					p.ExecCfg().Codec,
 					parentID,
-					getParentSchemaID(typ),
+					typ.GetParentSchemaID(),
 					typ.Name,
 				)
 				if err != nil {
@@ -742,7 +744,7 @@ func allocateDescriptorRewrites(
 					// Ensure that there isn't a collision with the array type name.
 					arrTyp := typesByID[typ.ArrayTypeID]
 					typeName := tree.NewUnqualifiedTypeName(arrTyp.GetName())
-					err = catalogkv.CheckObjectCollision(ctx, txn, p.ExecCfg().Codec, parentID, getParentSchemaID(typ), typeName)
+					err := catalogkv.CheckObjectCollision(ctx, txn, p.ExecCfg().Codec, parentID, typ.GetParentSchemaID(), typeName)
 					if err != nil {
 						return errors.Wrapf(err, "name collision for %q's array type", typ.Name)
 					}
@@ -815,13 +817,6 @@ func allocateDescriptorRewrites(
 		}
 
 		descriptorRewrites[db.GetID()] = &jobspb.RestoreDetails_DescriptorRewrite{ID: newID}
-
-		// If a database restore has specified a new name for the restored database,
-		// then populate the rewrite with the newDBName, else the restored database name is preserved.
-		if newDBName != "" {
-			descriptorRewrites[db.GetID()].NewDBName = newDBName
-		}
-
 		for _, tableID := range needsNewParentIDs[db.GetName()] {
 			descriptorRewrites[tableID] = &jobspb.RestoreDetails_DescriptorRewrite{ParentID: newID}
 		}
@@ -893,12 +888,13 @@ func resolveTargetDB(
 	txn *kv.Txn,
 	p sql.PlanHookState,
 	databasesByID map[descpb.ID]*dbdesc.Mutable,
-	intoDB string,
+	renaming bool,
+	overrideDB string,
 	descriptorCoverage tree.DescriptorCoverage,
 	descriptor catalog.Descriptor,
 ) (string, error) {
-	if intoDB != "" {
-		return intoDB, nil
+	if renaming {
+		return overrideDB, nil
 	}
 
 	if descriptorCoverage == tree.AllDescriptors && descriptor.GetParentID() < catalogkeys.MaxDefaultDescriptorID {
@@ -958,7 +954,7 @@ func maybeUpgradeDescriptors(
 		if tableDesc, isTable := desc.(catalog.TableDescriptor); isTable {
 			b = tabledesc.NewBuilderForFKUpgrade(tableDesc.TableDesc(), skipFKsWithNoMatchingTable)
 		} else {
-			b = desc.NewBuilder()
+			b = catalogkv.NewBuilder(desc.DescriptorProto())
 		}
 		err := b.RunPostDeserializationChanges(ctx, descGetter)
 		if err != nil {
@@ -1016,25 +1012,20 @@ func rewriteDatabaseDescs(databases []*dbdesc.Mutable, descriptorRewrites DescRe
 		}
 		db.ID = rewrite.ID
 
-		if rewrite.NewDBName != "" {
-			db.Name = rewrite.NewDBName
-		}
-
 		db.Version = 1
 		db.ModificationTime = hlc.Timestamp{}
 
 		// Rewrite the name-to-ID mapping for the database's child schemas.
 		newSchemas := make(map[string]descpb.DatabaseDescriptor_SchemaInfo)
-		err := db.ForEachNonDroppedSchema(func(id descpb.ID, name string) error {
-			rewrite, ok := descriptorRewrites[id]
+		for schemaName, schemaInfo := range db.Schemas {
+			if schemaInfo.Dropped {
+				continue
+			}
+			rewrite, ok := descriptorRewrites[schemaInfo.ID]
 			if !ok {
 				return errors.Errorf("missing rewrite for schema %d", db.ID)
 			}
-			newSchemas[name] = descpb.DatabaseDescriptor_SchemaInfo{ID: rewrite.ID}
-			return nil
-		})
-		if err != nil {
-			return err
+			newSchemas[schemaName] = descpb.DatabaseDescriptor_SchemaInfo{ID: rewrite.ID}
 		}
 		db.Schemas = newSchemas
 	}
@@ -1208,6 +1199,36 @@ func RewriteTableDescs(
 			table.ViewQuery = viewQuery
 		}
 
+		if err := catalog.ForEachNonDropIndex(table, func(indexI catalog.Index) error {
+			index := indexI.IndexDesc()
+			// Verify that for any interleaved index being restored, the interleave
+			// parent is also being restored. Otherwise, the interleave entries in the
+			// restored IndexDescriptors won't have anything to point to.
+			// TODO(dan): It seems like this restriction could be lifted by restoring
+			// stub TableDescriptors for the missing interleave parents.
+			for j, a := range index.Interleave.Ancestors {
+				ancestorRewrite, ok := descriptorRewrites[a.TableID]
+				if !ok {
+					return errors.Errorf(
+						"cannot restore table %q without interleave parent %d", table.Name, a.TableID,
+					)
+				}
+				index.Interleave.Ancestors[j].TableID = ancestorRewrite.ID
+			}
+			for j, c := range index.InterleavedBy {
+				childRewrite, ok := descriptorRewrites[c.Table]
+				if !ok {
+					return errors.Errorf(
+						"cannot restore table %q without interleave child table %d", table.Name, c.Table,
+					)
+				}
+				index.InterleavedBy[j].Table = childRewrite.ID
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+
 		// TODO(lucy): deal with outbound foreign key mutations here as well.
 		origFKs := table.OutboundFKs
 		table.OutboundFKs = nil
@@ -1368,12 +1389,8 @@ func getUserDescriptorNames(
 	return allNames, nil
 }
 
-// resolveOptionsForRestoreJobDescription creates a copy of
-// the options specified during a restore, after processing
-// them to be suitable for displaying in the jobs' description.
-// This includes redacting secrets from external storage URIs.
 func resolveOptionsForRestoreJobDescription(
-	opts tree.RestoreOptions, intoDB string, newDBName string, kmsURIs []string,
+	opts tree.RestoreOptions, intoDB string, kmsURIs []string,
 ) (tree.RestoreOptions, error) {
 	if opts.IsDefault() {
 		return opts, nil
@@ -1395,10 +1412,6 @@ func resolveOptionsForRestoreJobDescription(
 		newOpts.IntoDB = tree.NewDString(intoDB)
 	}
 
-	if opts.NewDBName != nil {
-		newOpts.NewDBName = tree.NewDString(newDBName)
-	}
-
 	for _, uri := range kmsURIs {
 		redactedURI, err := cloud.RedactKMSURI(uri)
 		if err != nil {
@@ -1416,7 +1429,6 @@ func restoreJobDescription(
 	from [][]string,
 	opts tree.RestoreOptions,
 	intoDB string,
-	newDBName string,
 	kmsURIs []string,
 ) (string, error) {
 	r := &tree.Restore{
@@ -1428,8 +1440,7 @@ func restoreJobDescription(
 
 	var options tree.RestoreOptions
 	var err error
-	if options, err = resolveOptionsForRestoreJobDescription(opts, intoDB, newDBName,
-		kmsURIs); err != nil {
+	if options, err = resolveOptionsForRestoreJobDescription(opts, intoDB, kmsURIs); err != nil {
 		return "", err
 	}
 	r.Options = options
@@ -1513,19 +1524,6 @@ func restorePlanHook(
 		}
 	}
 
-	var newDBNameFn func() (string, error)
-	if restoreStmt.Options.NewDBName != nil {
-		if restoreStmt.DescriptorCoverage == tree.AllDescriptors || len(restoreStmt.Targets.Databases) != 1 {
-			err = errors.New("new_db_name can only be used for RESTORE DATABASE with a single target" +
-				" database")
-			return nil, nil, nil, false, err
-		}
-		newDBNameFn, err = p.TypeAsString(ctx, restoreStmt.Options.NewDBName, "RESTORE")
-		if err != nil {
-			return nil, nil, nil, false, err
-		}
-	}
-
 	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
 		// TODO(dan): Move this span into sql.
 		ctx, span := tracing.ChildSpan(ctx, stmt.StatementTag())
@@ -1598,15 +1596,7 @@ func restorePlanHook(
 			}
 		}
 
-		var newDBName string
-		if newDBNameFn != nil {
-			newDBName, err = newDBNameFn()
-			if err != nil {
-				return err
-			}
-		}
-		return doRestorePlan(ctx, restoreStmt, p, from, passphrase, kms, intoDB, newDBName, endTime,
-			resultsCh)
+		return doRestorePlan(ctx, restoreStmt, p, from, passphrase, kms, intoDB, endTime, resultsCh)
 	}
 
 	if restoreStmt.Options.Detached {
@@ -1649,7 +1639,8 @@ func checkPrivilegesForRestore(
 				"only users with the CREATEDB privilege can restore databases")
 		}
 	}
-	if p.ExecCfg().ExternalIODirConfig.EnableNonAdminImplicitAndArbitraryOutbound {
+	knobs := p.ExecCfg().BackupRestoreTestingKnobs
+	if knobs != nil && knobs.AllowImplicitAccess {
 		return nil
 	}
 	// Check that none of the sources rely on implicit access.
@@ -1728,7 +1719,6 @@ func doRestorePlan(
 	passphrase string,
 	kms []string,
 	intoDB string,
-	newDBName string,
 	endTime hlc.Timestamp,
 	resultsCh chan<- tree.Datums,
 ) error {
@@ -1835,7 +1825,8 @@ func doRestorePlan(
 				continue
 			}
 			index := table.GetPrimaryIndex()
-			if len(index.Interleave.Ancestors) > 0 || len(index.InterleavedBy) > 0 {
+			if index.IsInterleaved() &&
+				currentVersion.IsActive(clusterversion.PreventNewInterleavedTables) {
 				return errors.Errorf("restoring interleaved tables is no longer allowed. table %s was found to be interleaved", table.Name)
 			}
 			if err := catalog.ForEachNonDropIndex(
@@ -1886,12 +1877,6 @@ func doRestorePlan(
 
 	if err := maybeUpgradeDescriptors(ctx, sqlDescs, restoreStmt.Options.SkipMissingFKs); err != nil {
 		return err
-	}
-
-	if restoreStmt.Options.NewDBName != nil {
-		if err := renameTargetDatabaseDescriptor(sqlDescs, restoreDBs, newDBName); err != nil {
-			return err
-		}
 	}
 
 	if len(tenants) > 0 {
@@ -1971,12 +1956,11 @@ func doRestorePlan(
 		restoreStmt.DescriptorCoverage,
 		restoreStmt.Options,
 		intoDB,
-		newDBName)
+	)
 	if err != nil {
 		return err
 	}
-	description, err := restoreJobDescription(p, restoreStmt, from, restoreStmt.Options, intoDB,
-		newDBName, kms)
+	description, err := restoreJobDescription(p, restoreStmt, from, restoreStmt.Options, intoDB, kms)
 	if err != nil {
 		return err
 	}
@@ -2099,6 +2083,7 @@ func doRestorePlan(
 	}(); err != nil {
 		return err
 	}
+
 	collectTelemetry()
 	if err := sj.Start(ctx); err != nil {
 		return err
@@ -2107,37 +2092,6 @@ func doRestorePlan(
 		return err
 	}
 	return sj.ReportExecutionResults(ctx, resultsCh)
-}
-
-// renameTargetDatabaseDescriptor updates the name in the target database
-// descriptor to the user specified new_db_name. We update the database
-// descriptor in both sqlDescs that contains all the descriptors being restored,
-// and restoreDBs that contains just the target database descriptor. Renaming
-// the target descriptor ensures accurate name resolution during restore.
-func renameTargetDatabaseDescriptor(
-	sqlDescs []catalog.Descriptor, restoreDBs []catalog.DatabaseDescriptor, newDBName string,
-) error {
-	if len(restoreDBs) != 1 {
-		return errors.NewAssertionErrorWithWrappedErrf(errors.Newf(
-			"expected restoreDBs to have a single entry but found %d entries when renaming the target"+
-				" database", len(restoreDBs)), "assertion failed")
-	}
-
-	for _, desc := range sqlDescs {
-		// Only process database descriptors.
-		db, isDB := desc.(*dbdesc.Mutable)
-		if !isDB {
-			continue
-		}
-		db.SetName(newDBName)
-	}
-	db, ok := restoreDBs[0].(*dbdesc.Mutable)
-	if !ok {
-		return errors.NewAssertionErrorWithWrappedErrf(errors.Newf(
-			"expected db desc but found %T", db), "assertion failed")
-	}
-	db.SetName(newDBName)
-	return nil
 }
 
 func planDatabaseModifiersForRestore(
