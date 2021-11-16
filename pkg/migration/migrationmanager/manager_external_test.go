@@ -143,13 +143,13 @@ RETURNING id;`).Scan(&secondID))
 	require.Regexp(t, "found multiple non-terminal jobs for version", err)
 
 	// Let the fake, erroneous job finish with an error.
-	fakeJobBlockChan <- jobs.MarkAsPermanentJobError(errors.New("boom"))
+	fakeJobBlockChan <- errors.New("boom")
 	require.Regexp(t, "boom", <-runErr)
 
 	// Launch a second migration which later we'll ensure does not kick off
 	// another job. We'll make sure this happens by polling the trace to see
 	// the log line indicating what we want.
-	tr := tc.Server(0).TracerI().(*tracing.Tracer)
+	tr := tc.Server(0).Tracer().(*tracing.Tracer)
 	recCtx, getRecording, cancel := tracing.ContextWithRecordingSpan(ctx, tr, "test")
 	defer cancel()
 	upgrade2Err := make(chan error, 1)
@@ -511,7 +511,7 @@ func TestPrecondition(t *testing.T) {
 		) error {
 			atomic.AddInt64(run, 1)
 			if err.Load().(bool) {
-				return jobs.MarkAsPermanentJobError(errors.New("boom"))
+				return errors.New("boom")
 			}
 			return nil
 		}

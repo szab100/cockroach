@@ -135,7 +135,7 @@ func TestTableReader(t *testing.T) {
 					Cfg: &execinfra.ServerConfig{
 						Settings: st,
 						RangeCache: rangecache.NewRangeCache(s.ClusterSettings(), nil,
-							func() int64 { return 2 << 10 }, s.Stopper(), s.TracerI().(*tracing.Tracer)),
+							func() int64 { return 2 << 10 }, s.Stopper(), s.Tracer().(*tracing.Tracer)),
 					},
 					Txn:    kv.NewTxn(ctx, s.DB(), s.NodeID()),
 					NodeID: evalCtx.NodeID,
@@ -382,7 +382,7 @@ func TestLimitScans(t *testing.T) {
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 			RangeCache: rangecache.NewRangeCache(s.ClusterSettings(), nil,
-				func() int64 { return 2 << 10 }, s.Stopper(), s.TracerI().(*tracing.Tracer)),
+				func() int64 { return 2 << 10 }, s.Stopper(), s.Tracer().(*tracing.Tracer)),
 		},
 		Txn:    kv.NewTxn(ctx, kvDB, s.NodeID()),
 		NodeID: evalCtx.NodeID,
@@ -457,11 +457,13 @@ func TestLimitScans(t *testing.T) {
 			}
 		}
 		for _, l := range span.Logs {
-			match := re.FindStringSubmatch(l.Msg().StripMarkers())
-			if match == nil {
-				continue
+			for _, f := range l.Fields {
+				match := re.FindStringSubmatch(f.Value)
+				if match == nil {
+					continue
+				}
+				ranges[match[1]] = struct{}{}
 			}
-			ranges[match[1]] = struct{}{}
 		}
 	}
 	if len(ranges) != 1 {
@@ -497,7 +499,7 @@ func BenchmarkTableReader(b *testing.B) {
 			Cfg: &execinfra.ServerConfig{
 				Settings: st,
 				RangeCache: rangecache.NewRangeCache(s.ClusterSettings(), nil,
-					func() int64 { return 2 << 10 }, s.Stopper(), s.TracerI().(*tracing.Tracer)),
+					func() int64 { return 2 << 10 }, s.Stopper(), s.Tracer().(*tracing.Tracer)),
 			},
 			Txn:    kv.NewTxn(ctx, s.DB(), s.NodeID()),
 			NodeID: evalCtx.NodeID,

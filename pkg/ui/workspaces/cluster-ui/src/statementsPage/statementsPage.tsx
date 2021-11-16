@@ -11,7 +11,6 @@
 import React from "react";
 import { RouteComponentProps } from "react-router-dom";
 import { isNil, merge } from "lodash";
-import Helmet from "react-helmet";
 import moment, { Moment } from "moment";
 import classNames from "classnames/bind";
 import { Loading } from "src/loading";
@@ -65,7 +64,6 @@ import { UIConfigState } from "../store";
 import { StatementsRequest } from "src/api/statementsApi";
 import Long from "long";
 import ClearStats from "../sqlActivity/clearStats";
-import SQLActivityError from "../sqlActivity/errorComponent";
 import { commonStyles } from "../common";
 
 const cx = classNames.bind(styles);
@@ -568,24 +566,16 @@ export class StatementsPage extends React.Component<
 
   render(): React.ReactElement {
     const {
-      location,
       refreshStatementDiagnosticsRequests,
       onActivateStatementDiagnostics,
       onDiagnosticsModalOpen,
     } = this.props;
-    const app = queryByName(location, appAttr);
     return (
       <div className={cx("root", "table-area")}>
-        <Helmet title={app ? `${app} App | Statements` : "Statements"} />
         <Loading
           loading={isNil(this.props.statements)}
           error={this.props.statementsError}
           render={this.renderStatements}
-          renderError={() =>
-            SQLActivityError({
-              statsType: "statements",
-            })
-          }
         />
         <ActivateStatementDiagnosticsModal
           ref={this.activateDiagnosticsRef}

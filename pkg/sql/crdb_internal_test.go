@@ -49,7 +49,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 	"github.com/jackc/pgtype"
 	"github.com/stretchr/testify/assert"
@@ -220,10 +219,11 @@ CREATE TABLE t.test (k INT);
 		t.Fatal(err)
 	}
 	colDef := alterCmd.AST.(*tree.AlterTable).Cmds[0].(*tree.AlterTableAddColumn).ColumnDef
-	col, _, _, err := tabledesc.MakeColumnDefDescs(ctx, colDef, nil, nil)
+	cdd, err := tabledesc.MakeColumnDefDescs(ctx, colDef, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	col := cdd.ColumnDescriptor
 	col.ID = tableDesc.NextColumnID
 	tableDesc.NextColumnID++
 	tableDesc.Families[0].ColumnNames = append(tableDesc.Families[0].ColumnNames, col.Name)
@@ -707,7 +707,7 @@ func TestDistSQLFlowsVirtualTables(t *testing.T) {
 // root.child.remotechilddone		<-- traceID1
 // root2												<-- traceID2
 // 		root2.child								<-- traceID2
-func setupTraces(t1, t2 *tracing.Tracer) (tracingpb.TraceID, func()) {
+func setupTraces(t1, t2 *tracing.Tracer) (uint64, func()) {
 	// Start a root span on "node 1".
 	root := t1.StartSpan("root", tracing.WithForceRealSpan())
 	root.SetVerbose(true)
@@ -760,8 +760,8 @@ func TestClusterInflightTracesVirtualTable(t *testing.T) {
 	defer tc.Stopper().Stop(ctx)
 	sqlDB := sqlutils.MakeSQLRunner(tc.ServerConn(0))
 
-	node1Tracer := tc.Server(0).TracerI().(*tracing.Tracer)
-	node2Tracer := tc.Server(1).TracerI().(*tracing.Tracer)
+	node1Tracer := tc.Server(0).Tracer().(*tracing.Tracer)
+	node2Tracer := tc.Server(1).Tracer().(*tracing.Tracer)
 
 	traceID, cleanup := setupTraces(node1Tracer, node2Tracer)
 	defer cleanup()

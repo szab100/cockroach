@@ -148,8 +148,11 @@ func avroFieldMetadataToColDesc(metadata string) (*descpb.ColumnDescriptor, erro
 	def := parsed.AST.(*tree.AlterTable).Cmds[0].(*tree.AlterTableAddColumn).ColumnDef
 	ctx := context.Background()
 	semaCtx := makeTestSemaCtx()
-	col, _, _, err := tabledesc.MakeColumnDefDescs(ctx, def, &semaCtx, &tree.EvalContext{})
-	return col, err
+	cdd, err := tabledesc.MakeColumnDefDescs(ctx, def, &semaCtx, &tree.EvalContext{})
+	if err != nil {
+		return nil, err
+	}
+	return cdd.ColumnDescriptor, err
 }
 
 // randTime generates a random time.Time whose .UnixNano result doesn't
@@ -192,7 +195,7 @@ func createEnum(enumLabels tree.EnumValueList, typeName tree.TypeName) *types.T 
 func TestAvroSchema(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	rng, _ := randutil.NewTestRand()
+	rng, _ := randutil.NewPseudoRand()
 
 	type test struct {
 		name   string
@@ -814,7 +817,7 @@ func TestDecimalRatRoundtrip(t *testing.T) {
 		require.EqualError(t, err, "cannot convert Infinite form decimal")
 	})
 	t.Run(`rand`, func(t *testing.T) {
-		rng, _ := randutil.NewTestRand()
+		rng, _ := randutil.NewPseudoRand()
 		precision := rng.Int31n(10) + 1
 		scale := rng.Int31n(precision + 1)
 		coeff := rng.Int63n(int64(math.Pow10(int(precision))))
@@ -852,7 +855,7 @@ func benchmarkEncodeType(b *testing.B, typ *types.T, encRow rowenc.EncDatumRow) 
 func randEncDatumRow(typ *types.T) rowenc.EncDatumRow {
 	const allowNull = true
 	const notNull = false
-	rnd, _ := randutil.NewTestRand()
+	rnd, _ := randutil.NewTestPseudoRand()
 	return rowenc.EncDatumRow{
 		rowenc.DatumToEncDatum(typ, randgen.RandDatum(rnd, typ, allowNull)),
 		rowenc.DatumToEncDatum(types.Int, randgen.RandDatum(rnd, types.Int, notNull)),
@@ -917,7 +920,7 @@ func BenchmarkEncodeString(b *testing.B) {
 	benchmarkEncodeType(b, types.String, randEncDatumRow(types.String))
 }
 
-var collatedStringType = types.MakeCollatedString(types.String, `fr`)
+var collatedStringType *types.T = types.MakeCollatedString(types.String, `fr`)
 
 func BenchmarkEncodeCollatedString(b *testing.B) {
 	benchmarkEncodeType(b, collatedStringType, randEncDatumRow(collatedStringType))

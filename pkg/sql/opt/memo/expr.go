@@ -24,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -202,10 +201,10 @@ func (n FiltersExpr) OuterCols() opt.ColSet {
 	return colSet
 }
 
-// Sort sorts the FilterItems in n by the ranks of the expressions.
+// Sort sorts the FilterItems in n by the IDs of the expression.
 func (n *FiltersExpr) Sort() {
 	sort.Slice(*n, func(i, j int) bool {
-		return (*n)[i].Condition.Rank() < (*n)[j].Condition.Rank()
+		return (*n)[i].Condition.(opt.ScalarExpr).ID() < (*n)[j].Condition.(opt.ScalarExpr).ID()
 	})
 }
 
@@ -358,19 +357,14 @@ type ScanFlags struct {
 
 	// ForceIndex forces the use of a specific index (specified in Index).
 	// ForceIndex and NoIndexJoin cannot both be set at the same time.
-	ForceIndex  bool
-	ForceZigzag bool
-	Direction   tree.Direction
-	Index       int
-
-	// ZigzagIndexes makes planner prefer a zigzag with particular indexes.
-	// ForceZigzag must also be true.
-	ZigzagIndexes util.FastIntSet
+	ForceIndex bool
+	Direction  tree.Direction
+	Index      int
 }
 
 // Empty returns true if there are no flags set.
 func (sf *ScanFlags) Empty() bool {
-	return *sf == ScanFlags{}
+	return !sf.NoIndexJoin && !sf.NoZigzagJoin && !sf.NoFullScan && !sf.ForceIndex
 }
 
 // JoinFlags stores restrictions on the join execution method, derived from
@@ -951,23 +945,6 @@ func OutputColumnIsAlwaysNull(e RelExpr, col opt.ColumnID) bool {
 	}
 
 	return false
-}
-
-// CollectContiguousOrExprs finds all OrExprs in 'e' that are connected via
-// a parent-child relationship, and returns them in an array of ScalarExprs.
-func CollectContiguousOrExprs(e opt.ScalarExpr) []opt.ScalarExpr {
-	var disjunctions = make([]opt.ScalarExpr, 0, 2)
-	var collectDisjunctions func(e opt.ScalarExpr)
-	collectDisjunctions = func(e opt.ScalarExpr) {
-		if or, ok := e.(*OrExpr); ok {
-			collectDisjunctions(or.Left)
-			collectDisjunctions(or.Right)
-		} else {
-			disjunctions = append(disjunctions, e)
-		}
-	}
-	collectDisjunctions(e)
-	return disjunctions
 }
 
 // FKCascades stores metadata necessary for building cascading queries.
