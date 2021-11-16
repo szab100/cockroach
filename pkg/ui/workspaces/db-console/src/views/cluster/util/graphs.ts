@@ -635,7 +635,6 @@ export function configureUPlotLineChart(
           // value determines how these values show up in the legend
           value: (_u: uPlot, rawValue: number) =>
             getLatestYAxisDomain().guideFormat(rawValue),
-          spanGaps: false,
         };
       }),
     ],

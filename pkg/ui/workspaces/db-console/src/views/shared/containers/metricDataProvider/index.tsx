@@ -31,7 +31,6 @@ import {
 import { PayloadAction } from "src/interfaces/action";
 import { TimeWindow, TimeScale } from "src/redux/timewindow";
 import { History } from "history";
-import { refreshSettings } from "src/redux/apiReducers";
 
 /**
  * queryFromProps is a helper method which generates a TimeSeries Query data
@@ -91,7 +90,6 @@ interface MetricsDataProviderConnectProps {
   metrics: MetricsQuery;
   timeInfo: QueryTimeInfo;
   requestMetrics: typeof requestMetricsAction;
-  refreshNodeSettings: typeof refreshSettings;
   setTimeRange?: (tw: TimeWindow) => PayloadAction<TimeWindow>;
   setTimeScale?: (ts: TimeScale) => PayloadAction<TimeScale>;
   history?: History;
@@ -106,10 +104,6 @@ interface MetricsDataProviderExplicitProps {
   // If current is true, uses the current time instead of the global timewindow.
   current?: boolean;
   children?: React.ReactElement<{}>;
-  adjustTimeScaleOnChange?: (
-    curTimeScale: TimeScale,
-    timeWindow: TimeWindow,
-  ) => TimeScale;
 }
 
 /**
@@ -198,7 +192,6 @@ class MetricsDataProvider extends React.Component<
   componentDidMount() {
     // Refresh nodes status query when mounting.
     this.refreshMetricsIfStale(this.props);
-    this.props.refreshNodeSettings();
   }
 
   componentDidUpdate() {
@@ -223,7 +216,6 @@ class MetricsDataProvider extends React.Component<
   }
 
   render() {
-    const { adjustTimeScaleOnChange } = this.props;
     // MetricsDataProvider should contain only one direct child.
     const child = React.Children.only(this.props.children);
     const dataProps: MetricsDataComponentProps = {
@@ -232,7 +224,6 @@ class MetricsDataProvider extends React.Component<
       setTimeRange: this.props.setTimeRange,
       setTimeScale: this.props.setTimeScale,
       history: this.props.history,
-      adjustTimeScaleOnChange,
     };
     return React.cloneElement(
       child as React.ReactElement<MetricsDataComponentProps>,
@@ -289,7 +280,6 @@ const metricsDataProviderConnected = connect(
   },
   {
     requestMetrics: requestMetricsAction,
-    refreshNodeSettings: refreshSettings,
   },
 )(MetricsDataProvider);
 

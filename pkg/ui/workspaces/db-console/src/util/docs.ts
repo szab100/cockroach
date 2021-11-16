@@ -99,7 +99,3 @@ export const enterpriseLicensing =
 
 // Not actually a docs URL.
 export const startTrial = "https://www.cockroachlabs.com/pricing/start-trial/";
-
-export const reduceStorageOfTimeSeriesDataOperationalFlags = docsURL(
-  "operational-faqs.html#can-i-reduce-or-disable-the-storage-of-time-series-data",
-);

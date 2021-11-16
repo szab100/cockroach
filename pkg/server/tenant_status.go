@@ -346,7 +346,7 @@ func (t *tenantStatusServer) ResetSQLStats(
 	ctx = propagateGatewayMetadata(ctx)
 	ctx = t.AnnotateCtx(ctx)
 
-	if _, err := t.privilegeChecker.requireAdminUser(ctx); err != nil {
+	if _, err := t.privilegeChecker.requireViewActivityPermission(ctx); err != nil {
 		return nil, err
 	}
 
@@ -661,22 +661,6 @@ func (t *tenantStatusServer) ListDistSQLFlows(
 	return t.ListLocalDistSQLFlows(ctx, request)
 }
 
-// Profile implements the profiling endpoint by delegating the request
-// to the local handler. No facility for requesting profiles from
-// remote nodes is facilitated at this time. Requests for nodes other
-// than "local" will return an error.
-func (t *tenantStatusServer) Profile(
-	ctx context.Context, request *serverpb.ProfileRequest,
-) (*serverpb.JSONResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
-	ctx = t.AnnotateCtx(ctx)
-
-	if request.NodeId != "local" {
-		return nil, status.Errorf(codes.Unimplemented, "profiling arbitrary tenants is unsupported")
-	}
-	return profileLocal(ctx, request, t.st)
-}
-
 func (t *tenantStatusServer) IndexUsageStatistics(
 	ctx context.Context, req *serverpb.IndexUsageStatisticsRequest,
 ) (*serverpb.IndexUsageStatisticsResponse, error) {
@@ -737,69 +721,6 @@ func (t *tenantStatusServer) IndexUsageStatistics(
 		fetchIndexUsageStats,
 		aggFn,
 		errFn,
-	); err != nil {
-		return nil, err
-	}
-
-	// Append last reset time.
-	resp.LastReset = t.sqlServer.pgServer.SQLServer.GetLocalIndexStatistics().GetLastReset()
-
-	return resp, nil
-}
-
-func (t *tenantStatusServer) ResetIndexUsageStats(
-	ctx context.Context, req *serverpb.ResetIndexUsageStatsRequest,
-) (*serverpb.ResetIndexUsageStatsResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
-	ctx = t.AnnotateCtx(ctx)
-
-	if _, err := t.privilegeChecker.requireAdminUser(ctx); err != nil {
-		return nil, err
-	}
-
-	localReq := &serverpb.ResetIndexUsageStatsRequest{
-		NodeID: "local",
-	}
-	resp := &serverpb.ResetIndexUsageStatsResponse{}
-
-	if len(req.NodeID) > 0 {
-		parsedInstanceID, local, err := t.parseInstanceID(req.NodeID)
-		if err != nil {
-			return nil, status.Error(codes.InvalidArgument, err.Error())
-		}
-		if local {
-			t.sqlServer.pgServer.SQLServer.GetLocalIndexStatistics().Reset()
-			return resp, nil
-		}
-
-		instance, err := t.sqlServer.sqlInstanceProvider.GetInstance(ctx, parsedInstanceID)
-		if err != nil {
-			return nil, err
-		}
-		statusClient, err := t.dialPod(ctx, parsedInstanceID, instance.InstanceAddr)
-		if err != nil {
-			return nil, err
-		}
-
-		return statusClient.ResetIndexUsageStats(ctx, localReq)
-	}
-
-	resetIndexUsageStats := func(ctx context.Context, client interface{}, _ base.SQLInstanceID) (interface{}, error) {
-		statusClient := client.(serverpb.StatusClient)
-		return statusClient.ResetIndexUsageStats(ctx, localReq)
-	}
-
-	var combinedError error
-
-	if err := t.iteratePods(ctx, fmt.Sprintf("Resetting index usage stats for instance %s", req.NodeID),
-		t.dialCallback,
-		resetIndexUsageStats,
-		func(instanceID base.SQLInstanceID, resp interface{}) {
-			// Nothing to do here.
-		},
-		func(_ base.SQLInstanceID, err error) {
-			combinedError = errors.CombineErrors(combinedError, err)
-		},
 	); err != nil {
 		return nil, err
 	}

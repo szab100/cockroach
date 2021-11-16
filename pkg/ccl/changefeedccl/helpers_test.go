@@ -250,9 +250,7 @@ func parseTimeToHLC(t testing.TB, s string) hlc.Timestamp {
 	return ts
 }
 
-// Expect to receive a resolved timestamp and the partition it belongs to from
-// a test changefeed.
-func expectResolvedTimestamp(t testing.TB, f cdctest.TestFeed) (hlc.Timestamp, string) {
+func expectResolvedTimestamp(t testing.TB, f cdctest.TestFeed) hlc.Timestamp {
 	t.Helper()
 	m, err := f.Next()
 	if err != nil {
@@ -260,7 +258,7 @@ func expectResolvedTimestamp(t testing.TB, f cdctest.TestFeed) (hlc.Timestamp, s
 	} else if m == nil {
 		t.Fatal(`expected message`)
 	}
-	return extractResolvedTimestamp(t, m), m.Partition
+	return extractResolvedTimestamp(t, m)
 }
 
 func extractResolvedTimestamp(t testing.TB, m *cdctest.TestFeedMessage) hlc.Timestamp {
@@ -345,7 +343,7 @@ func startTestFullServer(
 	}
 
 	ctx := context.Background()
-	resetFlushFrequency := changefeedbase.TestingSetDefaultMinCheckpointFrequency(testSinkFlushFrequency)
+	resetFlushFrequency := changefeedbase.TestingSetDefaultFlushFrequency(testSinkFlushFrequency)
 	s, db, _ := serverutils.StartServer(t, args)
 
 	cleanup := func() {
@@ -383,7 +381,7 @@ func startTestCluster(t testing.TB) (serverutils.TestClusterInterface, *gosql.DB
 		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 	}
 
-	resetFlushFrequency := changefeedbase.TestingSetDefaultMinCheckpointFrequency(testSinkFlushFrequency)
+	resetFlushFrequency := changefeedbase.TestingSetDefaultFlushFrequency(testSinkFlushFrequency)
 	cluster, db, cleanup := multiregionccltestutils.TestingCreateMultiRegionCluster(
 		t, 3 /* numServers */, knobs,
 		multiregionccltestutils.WithUseDatabase("d"),
