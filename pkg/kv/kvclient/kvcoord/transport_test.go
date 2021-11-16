@@ -151,14 +151,15 @@ func (*mockInternalClient) ResetQuorum(
 func (m *mockInternalClient) Batch(
 	ctx context.Context, in *roachpb.BatchRequest, opts ...grpc.CallOption,
 ) (*roachpb.BatchResponse, error) {
-	sp := m.tr.StartSpan("mock", tracing.WithRecording(tracing.RecordingVerbose))
+	sp := m.tr.StartSpan("mock", tracing.WithForceRealSpan())
 	defer sp.Finish()
+	sp.SetVerbose(true)
 	ctx = tracing.ContextWithSpan(ctx, sp)
 
 	log.Eventf(ctx, "mockInternalClient processing batch")
 	br := &roachpb.BatchResponse{}
 	br.Error = m.pErr
-	if rec := sp.GetRecording(tracing.RecordingVerbose); rec != nil {
+	if rec := sp.GetRecording(); rec != nil {
 		br.CollectedSpans = append(br.CollectedSpans, rec...)
 	}
 	return br, nil
@@ -189,22 +190,4 @@ func (m *mockInternalClient) Join(
 	context.Context, *roachpb.JoinNodeRequest, ...grpc.CallOption,
 ) (*roachpb.JoinNodeResponse, error) {
 	return nil, fmt.Errorf("unsupported Join call")
-}
-
-func (m *mockInternalClient) TokenBucket(
-	ctx context.Context, in *roachpb.TokenBucketRequest, _ ...grpc.CallOption,
-) (*roachpb.TokenBucketResponse, error) {
-	return nil, fmt.Errorf("unsupported TokenBucket call")
-}
-
-func (m *mockInternalClient) GetSpanConfigs(
-	_ context.Context, _ *roachpb.GetSpanConfigsRequest, _ ...grpc.CallOption,
-) (*roachpb.GetSpanConfigsResponse, error) {
-	return nil, fmt.Errorf("unsupported GetSpanConfigs call")
-}
-
-func (m *mockInternalClient) UpdateSpanConfigs(
-	_ context.Context, _ *roachpb.UpdateSpanConfigsRequest, _ ...grpc.CallOption,
-) (*roachpb.UpdateSpanConfigsResponse, error) {
-	return nil, fmt.Errorf("unsupported UpdateSpanConfigs call")
 }
