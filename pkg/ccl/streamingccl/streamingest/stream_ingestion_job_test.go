@@ -38,17 +38,14 @@ import (
 func TestTenantStreaming(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	defer jobs.TestingSetAdoptAndCancelIntervals(100*time.Millisecond, 100*time.Millisecond)()
 
 	skip.UnderRace(t, "slow under race")
 
 	ctx := context.Background()
 
-	args := base.TestServerArgs{Knobs: base.TestingKnobs{
-		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals()},
-	}
-
 	// Start the source server.
-	source, sourceDB, _ := serverutils.StartServer(t, args)
+	source, sourceDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer source.Stopper().Stop(ctx)
 
 	// Start tenant server in the srouce cluster.
@@ -73,7 +70,7 @@ SET CLUSTER SETTING changefeed.experimental_poll_interval = '10ms'
 	log.TestingClearServerIdentifiers()
 
 	// Start the destination server.
-	hDest, cleanupDest := streamingtest.NewReplicationHelper(t, base.TestServerArgs{})
+	hDest, cleanupDest := streamingtest.NewReplicationHelper(t)
 	defer cleanupDest()
 	// destSQL refers to the system tenant as that's the one that's running the
 	// job.
