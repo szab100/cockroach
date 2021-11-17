@@ -167,6 +167,7 @@ func (c *conn) handleAuthentication(
 			if _, ok := c.sessionArgs.SessionDefaults[keyVal[0]]; !ok {
 				c.sessionArgs.SessionDefaults[keyVal[0]] = keyVal[1]
 			}
+
 		}
 	}
 

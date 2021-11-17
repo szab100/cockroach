@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 )
 
@@ -260,7 +259,7 @@ func (t *descriptorState) release(ctx context.Context, s *descriptorVersionState
 		return nil
 	}
 	if l := maybeRemoveLease(); l != nil {
-		releaseLease(ctx, l, t.m)
+		releaseLease(l, t.m)
 	}
 }
 
@@ -274,9 +273,7 @@ func (t *descriptorState) maybeQueueLeaseRenewal(
 	}
 
 	// Start the renewal. When it finishes, it will reset t.renewalInProgress.
-	newCtx := m.ambientCtx.AnnotateCtx(context.Background())
-	newCtx = logtags.WithTags(newCtx, logtags.FromContext(ctx))
-	return t.stopper.RunAsyncTask(newCtx,
+	return t.stopper.RunAsyncTask(context.Background(),
 		"lease renewal", func(ctx context.Context) {
 			t.startLeaseRenewal(ctx, m, id, name)
 		})

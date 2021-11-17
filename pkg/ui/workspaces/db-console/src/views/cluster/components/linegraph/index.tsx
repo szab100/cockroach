@@ -41,8 +41,7 @@ import Visualization from "src/views/cluster/components/visualization";
 import { MilliToSeconds, NanoToMilli } from "src/util/convert";
 import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
-import { findClosestTimeScale, TimeWindow } from "src/redux/timewindow";
-import Long from "long";
+import { findClosestTimeScale } from "src/redux/timewindow";
 
 type TSResponse = protos.cockroach.ts.tspb.TimeSeriesQueryResponse;
 
@@ -55,7 +54,6 @@ export interface LineGraphProps extends MetricsDataComponentProps {
   hoverOn?: typeof hoverOn;
   hoverOff?: typeof hoverOff;
   hoverState?: HoverState;
-  preCalcGraphSize?: boolean;
 }
 
 interface LineGraphStateOld {
@@ -308,10 +306,7 @@ export class LineGraphOld extends React.Component<
 // touPlot formats our timeseries data into the format
 // uPlot expects which is a 2-dimensional array where the
 // first array contains the x-values (time).
-function touPlot(
-  data: formattedSeries[],
-  sampleDuration?: Long,
-): uPlot.AlignedData {
+function touPlot(data: formattedSeries[]): uPlot.AlignedData {
   // Here's an example of what this code is attempting to control for.
   // We produce `result` series that contain their own x-values. uPlot
   // expects *one* x-series that all y-values match up to. So first we
@@ -341,10 +336,8 @@ function touPlot(
     ),
   ].sort((a, b) => a - b);
 
-  const xValuesWithGaps = fillGaps(xValuesComplete, sampleDuration);
-
   const yValuesComplete: (number | null)[][] = data.map(series => {
-    return xValuesWithGaps.map(ts => {
+    return xValuesComplete.map(ts => {
       const found = series.values.find(
         dp => dp.timestamp_nanos.toNumber() === ts,
       );
@@ -352,45 +345,7 @@ function touPlot(
     });
   });
 
-  return [xValuesWithGaps.map(ts => NanoToMilli(ts)), ...yValuesComplete];
-}
-
-// TODO (koorosh): the same logic can be achieved with uPlot's series.gaps API starting from 1.6.15 version.
-export function fillGaps(
-  data: uPlot.AlignedData[0],
-  sampleDuration?: Long,
-): uPlot.AlignedData[0] {
-  if (data.length === 0 || !sampleDuration) {
-    return data;
-  }
-  const sampleDurationMillis = sampleDuration.toNumber();
-  const dataPointsNumber = data.length;
-  const expectedPointsNumber =
-    (data[data.length - 1] - data[0]) / sampleDurationMillis + 1;
-  if (dataPointsNumber === expectedPointsNumber) {
-    return data;
-  }
-  const yDataWithGaps: number[] = [];
-  // validate time intervals for y axis data
-  data.forEach((d, idx, arr) => {
-    // case for the last item
-    if (idx === arr.length - 1) {
-      yDataWithGaps.push(d);
-    }
-    const nextItem = data[idx + 1];
-    if (nextItem - d <= sampleDurationMillis) {
-      yDataWithGaps.push(d);
-      return;
-    }
-    for (
-      let i = d;
-      nextItem - i >= sampleDurationMillis;
-      i = i + sampleDurationMillis
-    ) {
-      yDataWithGaps.push(i);
-    }
-  });
-  return yDataWithGaps;
+  return [xValuesComplete.map(ts => NanoToMilli(ts)), ...yValuesComplete];
 }
 
 // LineGraph wraps the uPlot library into a React component
@@ -450,18 +405,11 @@ export class LineGraph extends React.Component<LineGraphProps, {}> {
     if (startMillis === endMillis) return;
     const start = MilliToSeconds(startMillis);
     const end = MilliToSeconds(endMillis);
-    const newTimeWindow: TimeWindow = {
+    this.props.setTimeRange({
       start: moment.unix(start),
       end: moment.unix(end),
-    };
-    let newTimeScale = findClosestTimeScale(end - start, start);
-    if (this.props.adjustTimeScaleOnChange) {
-      newTimeScale = this.props.adjustTimeScaleOnChange(
-        newTimeScale,
-        newTimeWindow,
-      );
-    }
-    this.props.setTimeRange(newTimeWindow);
+    });
+    const newTimeScale = findClosestTimeScale(end - start);
     this.props.setTimeScale(newTimeScale);
     const { pathname, search } = this.props.history.location;
     const urlParams = new URLSearchParams(search);
@@ -496,8 +444,9 @@ export class LineGraph extends React.Component<LineGraphProps, {}> {
 
   componentDidUpdate(prevProps: Readonly<LineGraphProps>) {
     if (
-      !this.props.data?.results ||
-      (prevProps.data === this.props.data && this.u !== undefined)
+      !this.props.data ||
+      !this.props.data.results ||
+      prevProps.data === this.props.data
     ) {
       return;
     }
@@ -507,7 +456,7 @@ export class LineGraph extends React.Component<LineGraphProps, {}> {
     const axis = this.axis(this.props);
 
     const fData = formatMetricData(metrics, data);
-    const uPlotData = touPlot(fData, this.props.timeInfo?.sampleDuration);
+    const uPlotData = touPlot(fData);
 
     // The values of `this.yAxisDomain` and `this.xAxisDomain`
     // are captured in arguments to `configureUPlotLineChart`
@@ -568,7 +517,7 @@ export class LineGraph extends React.Component<LineGraphProps, {}> {
   }
 
   render() {
-    const { title, subtitle, tooltip, data, preCalcGraphSize } = this.props;
+    const { title, subtitle, tooltip, data } = this.props;
 
     return (
       <Visualization
@@ -576,7 +525,6 @@ export class LineGraph extends React.Component<LineGraphProps, {}> {
         subtitle={subtitle}
         tooltip={tooltip}
         loading={!data}
-        preCalcGraphSize={preCalcGraphSize}
       >
         <div className="linegraph">
           <div ref={this.el} />

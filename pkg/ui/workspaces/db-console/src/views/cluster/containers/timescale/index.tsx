@@ -27,7 +27,6 @@ import "./timescale.styl";
 import { Divider } from "antd";
 import classNames from "classnames";
 import { createSelector } from "reselect";
-import { TimeScale, TimeWindow } from "src/redux/timewindow";
 
 export const dateFormat = "MMM DD,";
 export const timeFormat = "h:mmA";
@@ -42,10 +41,6 @@ export interface TimeScaleDropdownProps {
   nodeStatusesValid: boolean;
   // Track whether the default has been set.
   useTimeRange: boolean;
-  adjustTimeScaleOnChange?: (
-    curTimeScale: TimeScale,
-    timeWindow: TimeWindow,
-  ) => TimeScale;
 }
 
 export const getTimeLabel = (
@@ -137,7 +132,6 @@ export const TimeScaleDropdown: React.FC<TimeScaleDropdownProps> = ({
   dispatchRefreshNodes,
   nodeStatusesValid,
   useTimeRange,
-  adjustTimeScaleOnChange,
 }) => {
   const location = useLocation();
   const history = useHistory();
@@ -160,15 +154,7 @@ export const TimeScaleDropdown: React.FC<TimeScaleDropdownProps> = ({
     newSettings.windowEnd = null;
     if (newSettings) {
       setQueryParamsByDates(newSettings.windowSize, moment.utc());
-      let timeScale: TimeScale = { ...newSettings, key: newTimescaleKey.value };
-      if (adjustTimeScaleOnChange) {
-        const timeWindow: TimeWindow = {
-          start: moment.utc().subtract(newSettings.windowSize),
-          end: moment.utc(),
-        };
-        timeScale = adjustTimeScaleOnChange(timeScale, timeWindow);
-      }
-      setTimeScale(timeScale);
+      setTimeScale({ ...newSettings, key: newTimescaleKey.value });
     }
   };
 
@@ -218,18 +204,15 @@ export const TimeScaleDropdown: React.FC<TimeScaleDropdownProps> = ({
     } else {
       key = "Custom";
     }
-    let timeScale: TimeScale = {
+
+    setQueryParamsByDates(windowSize, windowEnd);
+    setTimeScale({
       ...currentScale,
       windowEnd,
       windowSize,
       key,
       ...selected,
-    };
-    if (adjustTimeScaleOnChange) {
-      timeScale = adjustTimeScaleOnChange(timeScale, currentWindow);
-    }
-    setQueryParamsByDates(windowSize, windowEnd);
-    setTimeScale(timeScale);
+    });
   };
 
   const getTimescaleOptions = () => {
@@ -289,7 +272,7 @@ export const TimeScaleDropdown: React.FC<TimeScaleDropdownProps> = ({
       (window && window.start) ||
       moment.utc().subtract(10, "minutes");
     const seconds = moment.duration(moment.utc(end).diff(start)).asSeconds();
-    let timeScale = timewindow.findClosestTimeScale(seconds);
+    const timeScale = timewindow.findClosestTimeScale(seconds);
     const now = moment.utc();
     if (
       moment.duration(now.diff(end)).asMinutes() >
@@ -298,30 +281,22 @@ export const TimeScaleDropdown: React.FC<TimeScaleDropdownProps> = ({
       timeScale.key = "Custom";
     }
     timeScale.windowEnd = null;
-    if (adjustTimeScaleOnChange) {
-      timeScale = adjustTimeScaleOnChange(timeScale, { start, end });
-    }
     setTimeRange({ end, start });
     setTimeScale(timeScale);
   };
 
   const setDateRange = ([start, end]: [moment.Moment, moment.Moment]) => {
-    const twDuration = moment.duration(moment.utc(end).diff(start));
-    const seconds = twDuration.asSeconds();
-    let timeScale = timewindow.findClosestTimeScale(seconds);
-    const timeWindow = {
-      ...currentWindow,
-      start,
-      end,
-    };
-    if (adjustTimeScaleOnChange) {
-      timeScale = adjustTimeScaleOnChange(timeScale, timeWindow);
-    }
+    const seconds = moment.duration(moment.utc(end).diff(start)).asSeconds();
+    const timeScale = timewindow.findClosestTimeScale(seconds);
     setTimeScale({
       ...timeScale,
       key: "Custom",
     });
-    setTimeRange(timeWindow);
+    setTimeRange({
+      ...window,
+      start,
+      end,
+    });
 
     const searchParams = new URLSearchParams(location.search);
     searchParams.set("start", start.format("X"));
