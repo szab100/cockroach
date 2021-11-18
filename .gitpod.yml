@@ -1,5 +1,6 @@
-image: ghcr.io/szab100/ws-full-docker19
-
+image:
+  file: .gitpod.Dockerfile
+checkoutLocation: "go/src/github.com/cockroachdb/cockroach"
 # tasks:
 #   - init: |
 #       go get github.com/spf13/cobra/cobra
